@@ -59,7 +59,8 @@ Here’s an example of how to use the `gearrs` library to submit a job to a Gear
         is_running.store(false, Ordering::Relaxed);
         client_loop_handle.await.unwrap()
     }
-}```
+}
+´´´
 
 This example demonstrates a simple job submission where we connect to the Gearman server at 127.0.0.1:4730, submit a job, and print the result.
 
@@ -67,6 +68,6 @@ This example demonstrates a simple job submission where we connect to the Gearma
 
 This project is licensed under either the MIT License or the Apache License 2.0, at your option. See the LICENSE-MIT or LICENSE-APACHE files for details.
 
-About Gearman
+## About Gearman
 
 Gearman is a job server that distributes work to multiple worker systems, allowing you to build scalable applications that can perform tasks concurrently. It's especially useful for systems that require job queues, parallel processing, and load balancing.
