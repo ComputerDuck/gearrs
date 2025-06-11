@@ -73,7 +73,7 @@ impl Job {
     pub async fn submit<'a, F>(
         self,
         function_name: F,
-        connection: &mut Client<'a>,
+        connection: &Client<'a>,
     ) -> Result<JobHandle, GearmanError>
     where
         F: Into<String>,
