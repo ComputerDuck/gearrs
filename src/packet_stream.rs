@@ -1,3 +1,5 @@
+use std::io::ErrorKind;
+
 use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -39,6 +41,7 @@ impl GearmanPacketReader {
         match timeout(self.read_timeout, self.reader.read_exact(&mut header_buf)).await {
             Ok(Ok(0)) => return Err(GearmanError::ConnectionClosed),
             Ok(Ok(_)) => {}
+            Ok(Err(e)) if e.kind() == ErrorKind::UnexpectedEof => return Err(GearmanError::UnexpectedEof),
             Ok(Err(e)) => return Err(GearmanError::IoError(e)),
             Err(_) => return Err(GearmanError::Timeout),
         }

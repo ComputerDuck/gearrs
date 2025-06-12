@@ -5,13 +5,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::net::TcpStream;
-use tokio::sync::{Mutex, Notify, RwLock, oneshot};
+use tokio::sync::{oneshot, Mutex, Notify, RwLock};
 use tokio::time::timeout;
 use url::Url;
 
 use crate::job_tracker::JobTracker;
 use crate::packet::{FromPacket, IntoPacket, Packet, PacketError, PacketType, ParseError};
-use crate::packet_stream::{GearmanPacketReader, GearmanPacketSender, packet_stream};
+use crate::packet_stream::{packet_stream, GearmanPacketReader, GearmanPacketSender};
 use crate::request::{EchoReq, GetStatus, GetStatusUnique, OptionReq};
 use crate::response::{EchoRes, Error, JobCreated, OptionRes, StatusRes, StatusResUnique};
 use crate::response::{WorkComplete, WorkData, WorkException, WorkFail, WorkStatus, WorkWarning};
@@ -46,6 +46,7 @@ pub enum GearmanError {
     InvalidPacket(PacketError),
     Timeout,
     ConnectionClosed,
+    UnexpectedEof,
 }
 
 impl std::fmt::Display for GearmanError {
@@ -57,6 +58,7 @@ impl std::fmt::Display for GearmanError {
             GearmanError::InvalidPacket(err) => write!(f, "Invalid Packet: {}", err),
             GearmanError::ConnectionClosed => write!(f, "Connection closed"),
             GearmanError::Timeout => write!(f, "Operation timed out"),
+            GearmanError::UnexpectedEof => write!(f, "Unexpected Eof"),
         }
     }
 }
@@ -76,7 +78,7 @@ impl From<tokio::time::error::Elapsed> for GearmanError {
 }
 
 #[derive(PartialEq, Debug)]
-enum WaitingType {
+pub(crate) enum WaitingType {
     OptionRes,
     StatusResUnique,
     JobCreated,
@@ -180,192 +182,175 @@ impl ClientLoop<'_> {
     /// This progresses the runner by one step. This should be run in a continous loop
     /// to listen for any incoming packages and parse them
     pub async fn step(&mut self) -> Result<(), GearmanError> {
-        while let Ok(packet) = self.reader.read_packet().await {
-            match packet.header().get_type() {
-                PacketType::JobCreated => {
-                    let read_lock = self.conn.waiting.read().await;
-                    let waiting = match *read_lock {
-                        Some(ref _waiting) if _waiting.is_type(WaitingType::JobCreated) => {
-                            drop(read_lock);
-                            self.conn.waiting.write().await.take().expect(
-                                "This option must have a value since it was previously read",
-                            )
-                        }
-                        _ => continue,
-                    };
-                    match JobCreated::from_packet(packet.clone()) {
-                        Ok(job_created) => {
-                            let handle = job_created.take_handle();
-                            let mut jobs = self.conn.jobs.write().await;
-                            if !jobs.is_registered(&handle) {
-                                jobs.register_job(handle);
-                            }
-                        }
-                        Err(_) => {}
-                    }
-                    waiting.submit(packet).expect("This waiting job must exist");
-                    self.conn.ready.notify_one();
-                }
-                PacketType::EchoRes => {
-                    let read_lock = self.conn.waiting.read().await;
-                    let waiting = match *read_lock {
-                        Some(ref _waiting) if _waiting.is_type(WaitingType::EchoRes) => {
-                            drop(read_lock);
-                            self.conn.waiting.write().await.take().expect(
-                                "This option must have a value since it was previously read",
-                            )
-                        }
-                        _ => continue,
-                    };
-                    waiting.submit(packet).expect("This waiting job must exist");
-                    self.conn.ready.notify_one();
-                }
-                PacketType::OptionRes => {
-                    let read_lock = self.conn.waiting.read().await;
-                    let waiting = match *read_lock {
-                        Some(ref _waiting) if _waiting.is_type(WaitingType::OptionRes) => {
-                            drop(read_lock);
-                            self.conn.waiting.write().await.take().expect(
-                                "This option must have a value since it was previously read",
-                            )
-                        }
-                        _ => continue,
-                    };
-                    waiting.submit(packet).expect("This waiting job must exist");
-                    self.conn.ready.notify_one();
-                }
-                PacketType::StatusRes => {
-                    let read_lock = self.conn.waiting.read().await;
-                    let waiting = match *read_lock {
-                        Some(ref _waiting) if _waiting.is_type(WaitingType::StatusRes) => {
-                            drop(read_lock);
-                            self.conn.waiting.write().await.take().expect(
-                                "This option must have a value since it was previously read",
-                            )
-                        }
-                        _ => continue,
-                    };
-                    waiting.submit(packet).expect("This waiting job must exist");
-                    self.conn.ready.notify_one();
-                }
-                PacketType::StatusResUnique => {
-                    let read_lock = self.conn.waiting.read().await;
-                    let waiting = match *read_lock {
-                        Some(ref _waiting) if _waiting.is_type(WaitingType::StatusResUnique) => {
-                            drop(read_lock);
-                            self.conn.waiting.write().await.take().expect(
-                                "This option must have a value since it was previously read",
-                            )
-                        }
-                        _ => continue,
-                    };
-                    waiting.submit(packet).expect("This waiting job must exist");
-                    self.conn.ready.notify_one();
-                }
-                PacketType::Error => {
-                    let read_lock = self.conn.waiting.read().await;
-                    if read_lock.is_some() {
-                        drop(read_lock);
-                        let waiting =
-                            self.conn.waiting.write().await.take().expect(
-                                "This option must have a value since it was previously read",
-                            );
-                        let _ = waiting.submit_error(packet);
-                    }
-                    self.conn.ready.notify_one();
-                }
-                PacketType::WorkStatus => {
-                    let work_status = match WorkStatus::from_packet(packet).ok() {
-                        Some(work_status) => work_status,
-                        None => continue,
-                    };
-                    let job_handle_lock = self.conn.jobs.write().await;
-                    let mut job_handle = job_handle_lock
-                        .get_handle_mut(work_status.get_job_handle())
-                        .await
-                        .expect("Job handle lock is owned here");
-                    job_handle.submit_status(work_status);
-                    drop(job_handle);
-                }
-                PacketType::WorkComplete => {
-                    let work_complete = match WorkComplete::from_packet(packet).ok() {
-                        Some(work_complete) => work_complete,
-                        None => continue,
-                    };
-                    let mut job_handle_lock = self.conn.jobs.write().await;
-                    let mut job_handle = job_handle_lock
-                        .get_handle_mut(work_complete.get_job_handle())
-                        .await
-                        .expect("Job handle lock is owned here");
-                    job_handle.submit_complete(work_complete.clone());
-                    println!("got here 444");
-                    drop(job_handle);
-                    job_handle_lock.unregister_job(work_complete.get_job_handle());
-                }
-                PacketType::WorkFail => {
-                    let work_fail = match WorkFail::from_packet(packet).ok() {
-                        Some(work_fail) => work_fail,
-                        None => continue,
-                    };
-                    let mut job_handle_lock = self.conn.jobs.write().await;
-                    let mut job_handle = job_handle_lock
-                        .get_handle_mut(work_fail.get_job_handle())
-                        .await
-                        .expect("Job handle lock is owned here");
-                    job_handle.submit_fail(work_fail.clone());
-                    drop(job_handle);
-                    job_handle_lock.unregister_job(work_fail.get_job_handle());
-                }
-                PacketType::WorkException => {
-                    let work_exception = match WorkException::from_packet(packet).ok() {
-                        Some(work_exception) => work_exception,
-                        None => continue,
-                    };
-                    let mut job_handle_lock = self.conn.jobs.write().await;
-                    let mut job_handle = job_handle_lock
-                        .get_handle_mut(work_exception.get_job_handle())
-                        .await
-                        .expect("Job handle lock is owned here");
-                    job_handle.submit_exception(work_exception.clone());
-                    drop(job_handle);
-                    job_handle_lock.unregister_job(work_exception.get_job_handle());
-                }
-                PacketType::WorkData => {
-                    let work_data = match WorkData::from_packet(packet).ok() {
-                        Some(work_data) => work_data,
-                        None => continue,
-                    };
-                    let job_handle_lock = self.conn.jobs.write().await;
-                    let job_handle = job_handle_lock
-                        .get_handle_mut(work_data.get_job_handle())
-                        .await
-                        .expect("Job handle lock is owned here");
-                    job_handle.submit_data(work_data);
-                }
-                PacketType::WorkWarning => {
-                    let work_warning = match WorkWarning::from_packet(packet).ok() {
-                        Some(work_warning) => work_warning,
-                        None => continue,
-                    };
-                    let job_handle_lock = self.conn.jobs.write().await;
-                    let job_handle = job_handle_lock
-                        .get_handle_mut(work_warning.get_job_handle())
-                        .await
-                        .expect("Job handle lock is owned here");
-                    job_handle.submit_warning(work_warning);
-                }
-                _ => {
-                    #[cfg(test)]
-                    eprintln!(
-                        "Unexpected packet type or no waiting job: {:?}",
-                        packet.header().get_type()
-                    );
-                    continue;
-                }
+        let packet = match self.reader.read_packet().await {
+            Ok(packet) => packet,
+            Err(GearmanError::UnexpectedEof) => return Ok(()),
+            Err(err) => return Err(err),
+        };
+        if packet.header().get_type().is_continuous() {
+            self.handle_continuous(packet).await;
+            Ok(())
+        } else {
+            let mut waiting_handle_lock = self.conn.waiting.write().await;
+            let incoming_type = match packet.header().get_type().into() {
+                Some(waiting_type) => waiting_type,
+                None => return Ok(()), // TODO suspicous packet / unexpected
+            };
+
+            if waiting_handle_lock
+                .as_ref()
+                .is_some_and(|w| w.is_type(incoming_type))
+            {
+                let waiting_handle = waiting_handle_lock.take().unwrap();
+                drop(waiting_handle_lock);
+                self.handle_waiting(packet, waiting_handle).await;
+                Ok(())
+            } else {
+                return Ok(())
+                // todo!() // return error or something / means no waiting handle or invalid packet
+                        // type in incoming packet
             }
         }
+    }
 
-        Ok(())
+    async fn handle_waiting(&mut self, packet: Packet, waiting: WaitingJob) {
+        match packet.header().get_type() {
+            PacketType::JobCreated => {
+                match JobCreated::from_packet(packet.clone()) {
+                    Ok(job_created) => {
+                        let handle = job_created.take_handle();
+                        let mut jobs = self.conn.jobs.write().await;
+                        if !jobs.is_registered(&handle) {
+                            jobs.register_job(handle);
+                        }
+                    }
+                    Err(_) => {}
+                }
+                waiting.submit(packet).expect("This waiting job must exist");
+                self.conn.ready.notify_one();
+            }
+            PacketType::EchoRes => {
+                waiting.submit(packet).expect("This waiting job must exist");
+                self.conn.ready.notify_one();
+            }
+            PacketType::OptionRes => {
+                waiting.submit(packet).expect("This waiting job must exist");
+                self.conn.ready.notify_one();
+            }
+            PacketType::StatusRes => {
+                waiting.submit(packet).expect("This waiting job must exist");
+                self.conn.ready.notify_one();
+            }
+            PacketType::StatusResUnique => {
+                waiting.submit(packet).expect("This waiting job must exist");
+                self.conn.ready.notify_one();
+            }
+            PacketType::Error => {
+                let _ = waiting.submit_error(packet);
+                self.conn.ready.notify_one();
+            }
+            _ => {
+                #[cfg(test)]
+                eprintln!(
+                    "Unexpected waiting packet type: {:?}",
+                    packet.header().get_type()
+                );
+                {};
+            }
+        }
+    }
+
+    async fn handle_continuous(&mut self, packet: Packet) {
+        match packet.header().get_type() {
+            PacketType::WorkStatus => {
+                let work_status = match WorkStatus::from_packet(packet).ok() {
+                    Some(work_status) => work_status,
+                    None => return,
+                };
+                let job_handle_lock = self.conn.jobs.write().await;
+                let mut job_handle = job_handle_lock
+                    .get_handle_mut(work_status.get_job_handle())
+                    .await
+                    .expect("Job handle lock is owned here");
+                job_handle.submit_status(work_status);
+                drop(job_handle);
+            }
+            PacketType::WorkComplete => {
+                let work_complete = match WorkComplete::from_packet(packet).ok() {
+                    Some(work_complete) => work_complete,
+                    None => return,
+                };
+                let mut job_handle_lock = self.conn.jobs.write().await;
+                let mut job_handle = job_handle_lock
+                    .get_handle_mut(work_complete.get_job_handle())
+                    .await
+                    .expect("Job handle lock is owned here");
+                job_handle.submit_complete(work_complete.clone());
+                println!("got here 444");
+                drop(job_handle);
+                job_handle_lock.unregister_job(work_complete.get_job_handle());
+            }
+            PacketType::WorkFail => {
+                let work_fail = match WorkFail::from_packet(packet).ok() {
+                    Some(work_fail) => work_fail,
+                    None => return,
+                };
+                let mut job_handle_lock = self.conn.jobs.write().await;
+                let mut job_handle = job_handle_lock
+                    .get_handle_mut(work_fail.get_job_handle())
+                    .await
+                    .expect("Job handle lock is owned here");
+                job_handle.submit_fail(work_fail.clone());
+                drop(job_handle);
+                job_handle_lock.unregister_job(work_fail.get_job_handle());
+            }
+            PacketType::WorkException => {
+                let work_exception = match WorkException::from_packet(packet).ok() {
+                    Some(work_exception) => work_exception,
+                    None => return,
+                };
+                let mut job_handle_lock = self.conn.jobs.write().await;
+                let mut job_handle = job_handle_lock
+                    .get_handle_mut(work_exception.get_job_handle())
+                    .await
+                    .expect("Job handle lock is owned here");
+                job_handle.submit_exception(work_exception.clone());
+                drop(job_handle);
+                job_handle_lock.unregister_job(work_exception.get_job_handle());
+            }
+            PacketType::WorkData => {
+                let work_data = match WorkData::from_packet(packet).ok() {
+                    Some(work_data) => work_data,
+                    None => return,
+                };
+                let job_handle_lock = self.conn.jobs.write().await;
+                let job_handle = job_handle_lock
+                    .get_handle_mut(work_data.get_job_handle())
+                    .await
+                    .expect("Job handle lock is owned here");
+                job_handle.submit_data(work_data);
+            }
+            PacketType::WorkWarning => {
+                let work_warning = match WorkWarning::from_packet(packet).ok() {
+                    Some(work_warning) => work_warning,
+                    None => return,
+                };
+                let job_handle_lock = self.conn.jobs.write().await;
+                let job_handle = job_handle_lock
+                    .get_handle_mut(work_warning.get_job_handle())
+                    .await
+                    .expect("Job handle lock is owned here");
+                job_handle.submit_warning(work_warning);
+            }
+            _ => {
+                #[cfg(test)]
+                eprintln!(
+                    "Unexpected continuous packet type: {:?}",
+                    packet.header().get_type()
+                );
+                {};
+            }
+        }
     }
 }
 
@@ -375,14 +360,32 @@ pub struct Client<'a> {
 }
 
 impl Client<'_> {
-    pub(super) async fn submit_job(&self, packet: Packet) -> Result<JobCreated, GearmanError> {
+    pub(super) async fn submit_job(
+        &self,
+        packet: Packet,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<JobCreated, GearmanError> {
         let (sender, receiver) = oneshot::channel();
         if self.conn.waiting.read().await.is_some() {
             self.conn.ready.notified().await;
         }
-        *self.conn.waiting.write().await = Some(WaitingJob::new(sender, WaitingType::JobCreated));
+        {
+            *self.conn.waiting.write().await =
+                Some(WaitingJob::new(sender, WaitingType::JobCreated));
+        }
         self.write_packet(packet).await?;
-        let waiting_result = receiver.await.expect("This channel should only close then the JobCreated command or an error is returned by the server");
+        let waiting_result = if let Some(timeout) = timeout {
+            match tokio::time::timeout(timeout, receiver).await {
+                Ok(recv) => recv.expect("This channel should only close then the JobCreated command or an error is returned by the server"),
+                Err(_) => {
+                    *self.conn.waiting.write().await = None;
+                    return Err(GearmanError::Timeout)
+                }
+            }
+        } else {
+            receiver.await.expect("This channel should only close then the JobCreated command or an error is returned by the server")
+        };
+
         match waiting_result {
             WaitingResult::Valid(packet) => {
                 JobCreated::from_packet(packet).map_err(|err| GearmanError::ParseError(err))
@@ -395,14 +398,30 @@ impl Client<'_> {
         }
     }
 
-    pub(super) async fn submit_echo(&self, packet: EchoReq) -> Result<EchoRes, GearmanError> {
+    pub(super) async fn submit_echo(
+        &self,
+        packet: EchoReq,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<EchoRes, GearmanError> {
         let (sender, receiver) = oneshot::channel();
         if self.conn.waiting.read().await.is_some() {
             self.conn.ready.notified().await;
         }
-        *self.conn.waiting.write().await = Some(WaitingJob::new(sender, WaitingType::EchoRes));
+        {
+            *self.conn.waiting.write().await = Some(WaitingJob::new(sender, WaitingType::EchoRes));
+        }
         self.write_packet(packet.to_packet()).await?;
-        let waiting_result = receiver.await.expect("This channel should only close then the JobCreated command or an error is returned by the server");
+        let waiting_result = if let Some(timeout) = timeout {
+            match tokio::time::timeout(timeout, receiver).await {
+                Ok(recv) => recv.expect("This channel should only close then the JobCreated command or an error is returned by the server"),
+                Err(_) => {
+                    *self.conn.waiting.write().await = None;
+                    return Err(GearmanError::Timeout)
+                }
+            }
+        } else {
+            receiver.await.expect("This channel should only close then the JobCreated command or an error is returned by the server")
+        };
         match waiting_result {
             WaitingResult::Valid(packet) => {
                 EchoRes::from_packet(packet).map_err(|err| GearmanError::ParseError(err))
@@ -416,14 +435,31 @@ impl Client<'_> {
     }
 
     #[allow(unused)] // TODO: add OptionReq
-    pub(super) async fn submit_option(&self, packet: OptionReq) -> Result<OptionRes, GearmanError> {
+    pub(super) async fn submit_option(
+        &self,
+        packet: OptionReq,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<OptionRes, GearmanError> {
         let (sender, receiver) = oneshot::channel();
         if self.conn.waiting.read().await.is_some() {
             self.conn.ready.notified().await;
         }
-        *self.conn.waiting.write().await = Some(WaitingJob::new(sender, WaitingType::OptionRes));
+        {
+            *self.conn.waiting.write().await =
+                Some(WaitingJob::new(sender, WaitingType::OptionRes));
+        }
         self.write_packet(packet.to_packet()).await?;
-        let waiting_result = receiver.await.expect("This channel should only close then the JobCreated command or an error is returned by the server");
+        let waiting_result = if let Some(timeout) = timeout {
+            match tokio::time::timeout(timeout, receiver).await {
+                Ok(recv) => recv.expect("This channel should only close then the JobCreated command or an error is returned by the server"),
+                Err(_) => {
+                    *self.conn.waiting.write().await = None;
+                    return Err(GearmanError::Timeout)
+                }
+            }
+        } else {
+            receiver.await.expect("This channel should only close then the JobCreated command or an error is returned by the server")
+        };
         match waiting_result {
             WaitingResult::Valid(packet) => {
                 OptionRes::from_packet(packet).map_err(|err| GearmanError::ParseError(err))
@@ -437,14 +473,31 @@ impl Client<'_> {
     }
 
     #[allow(unused)] // TODO: add StatusReq
-    pub(super) async fn submit_status(&self, packet: GetStatus) -> Result<StatusRes, GearmanError> {
+    pub(super) async fn submit_status(
+        &self,
+        packet: GetStatus,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<StatusRes, GearmanError> {
         let (sender, receiver) = oneshot::channel();
         if self.conn.waiting.read().await.is_some() {
             self.conn.ready.notified().await;
         }
-        *self.conn.waiting.write().await = Some(WaitingJob::new(sender, WaitingType::StatusRes));
+        {
+            *self.conn.waiting.write().await =
+                Some(WaitingJob::new(sender, WaitingType::StatusRes));
+        }
         self.write_packet(packet.to_packet()).await?;
-        let waiting_result = receiver.await.expect("This channel should only close then the JobCreated command or an error is returned by the server");
+        let waiting_result = if let Some(timeout) = timeout {
+            match tokio::time::timeout(timeout, receiver).await {
+                Ok(recv) => recv.expect("This channel should only close then the JobCreated command or an error is returned by the server"),
+                Err(_) => {
+                    *self.conn.waiting.write().await = None;
+                    return Err(GearmanError::Timeout)
+                }
+            }
+        } else {
+            receiver.await.expect("This channel should only close then the JobCreated command or an error is returned by the server")
+        };
         match waiting_result {
             WaitingResult::Valid(packet) => {
                 StatusRes::from_packet(packet).map_err(|err| GearmanError::ParseError(err))
@@ -461,15 +514,28 @@ impl Client<'_> {
     pub(super) async fn submit_status_unique(
         &self,
         packet: GetStatusUnique,
+        timeout: Option<std::time::Duration>,
     ) -> Result<StatusResUnique, GearmanError> {
         let (sender, receiver) = oneshot::channel();
         if self.conn.waiting.read().await.is_some() {
             self.conn.ready.notified().await;
         }
         self.write_packet(packet.to_packet()).await?;
-        *self.conn.waiting.write().await =
-            Some(WaitingJob::new(sender, WaitingType::StatusResUnique));
-        let waiting_result = receiver.await.expect("This channel should only close then the JobCreated command or an error is returned by the server");
+        {
+            *self.conn.waiting.write().await =
+                Some(WaitingJob::new(sender, WaitingType::StatusResUnique));
+        }
+        let waiting_result = if let Some(timeout) = timeout {
+            match tokio::time::timeout(timeout, receiver).await {
+                Ok(recv) => recv.expect("This channel should only close then the JobCreated command or an error is returned by the server"),
+                Err(_) => {
+                    *self.conn.waiting.write().await = None;
+                    return Err(GearmanError::Timeout)
+                }
+            }
+        } else {
+            receiver.await.expect("This channel should only close then the JobCreated command or an error is returned by the server")
+        };
         match waiting_result {
             WaitingResult::Valid(packet) => {
                 StatusResUnique::from_packet(packet).map_err(|err| GearmanError::ParseError(err))
