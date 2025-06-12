@@ -5,8 +5,8 @@ use std::sync::Mutex as StdMutex;
 use std::task::Waker;
 
 use bytes::Bytes;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::Mutex;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::connection::{Client, GearmanError};
 use crate::packet::IntoPacket;
@@ -78,6 +78,31 @@ impl Job {
     where
         F: Into<String>,
     {
+        self.inner_submit(function_name, connection, None).await
+    }
+
+    pub async fn submit_with_timeout<'a, F>(
+        self,
+        function_name: F,
+        connection: &Client<'a>,
+        timeout: std::time::Duration,
+    ) -> Result<JobHandle, GearmanError>
+    where
+        F: Into<String>,
+    {
+        self.inner_submit(function_name, connection, Some(timeout))
+            .await
+    }
+
+    async fn inner_submit<'a, F>(
+        self,
+        function_name: F,
+        connection: &Client<'a>,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<JobHandle, GearmanError>
+    where
+        F: Into<String>,
+    {
         let function_name: String = function_name.into();
 
         let uid;
@@ -116,7 +141,10 @@ impl Job {
                 }
             }
         };
-        let handle = connection.submit_job(job_packet).await?.take_handle();
+        let handle = connection
+            .submit_job(job_packet, timeout)
+            .await?
+            .take_handle();
         let waker = Arc::new(StdMutex::new(None));
         let (status_sender, status_receiver) = tokio::sync::watch::channel(JobStatus::Working);
         let job_handle = JobHandle {

@@ -1,5 +1,7 @@
 use bytes::{Buf, Bytes};
 
+use crate::connection::WaitingType;
+
 #[derive(Debug)]
 pub enum HeaderError {
     InvalidSize,
@@ -108,6 +110,17 @@ pub enum PacketType {
     WorkWarning = 29,
     StatusResUnique = 42,
 }
+
+impl PacketType {
+    pub fn is_continuous(&self) -> bool {
+        use PacketType::*;
+        match self {
+            WorkStatus | WorkComplete | WorkFail | WorkException | WorkData | WorkWarning => true,
+            _ => false,
+        }
+    }
+}
+
 impl PartialEq for PacketType {
     fn eq(&self, other: &Self) -> bool {
         self.clone() as i32 == other.clone() as i32
@@ -168,6 +181,18 @@ impl Into<[u8; 4]> for PacketType {
 impl Into<i32> for PacketType {
     fn into(self) -> i32 {
         self as i32
+    }
+}
+impl Into<Option<WaitingType>> for PacketType {
+    fn into(self) -> Option<WaitingType> {
+        match self {
+            Self::OptionRes => Some(WaitingType::OptionRes),
+            Self::StatusResUnique => Some(WaitingType::StatusResUnique),
+            Self::JobCreated => Some(WaitingType::JobCreated),
+            Self::EchoRes => Some(WaitingType::EchoRes),
+            Self::StatusRes => Some(WaitingType::StatusRes),
+            _ => None,
+        }
     }
 }
 
