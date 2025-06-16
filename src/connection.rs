@@ -77,7 +77,7 @@ impl From<tokio::time::error::Elapsed> for GearmanError {
     }
 }
 
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Debug, Clone)]
 pub(crate) enum WaitingType {
     OptionRes,
     StatusResUnique,
@@ -188,27 +188,46 @@ impl ClientLoop<'_> {
             Err(err) => return Err(err),
         };
         if packet.header().get_type().is_continuous() {
+            log::debug!("Received a continous packet: {packet:?}");
             self.handle_continuous(packet).await;
             Ok(())
         } else {
+            log::debug!("Received a waiting packet: {packet:?}");
             let mut waiting_handle_lock = self.conn.waiting.write().await;
-            let incoming_type = match packet.header().get_type().into() {
+            let incoming_type: WaitingType = match packet.header().get_type().into() {
                 Some(waiting_type) => waiting_type,
-                None => return Ok(()), // TODO suspicous packet / unexpected
+                None => return Ok(()), // TODO suspicous packet / unexpected -> but could also be
+                                       // from timed out request
             };
 
             if waiting_handle_lock
                 .as_ref()
-                .is_some_and(|w| w.is_type(incoming_type))
+                .is_some_and(|w| w.is_type(incoming_type.clone()))
             {
                 let waiting_handle = waiting_handle_lock.take().unwrap();
                 drop(waiting_handle_lock);
                 self.handle_waiting(packet, waiting_handle).await;
                 Ok(())
             } else {
-                return Ok(())
-                // todo!() // return error or something / means no waiting handle or invalid packet
-                        // type in incoming packet
+                match waiting_handle_lock.as_ref() {
+                    Some(handle) => {
+                        return Err(GearmanError::InvalidPacket(PacketError::Parse(Box::new(
+                            ParseError::with_message(format!(
+                                "Expected packet of type {:?}, found {:?}",
+                                handle.waiting_type,
+                                incoming_type
+                            )),
+                        ))));
+                    }
+                    None => {
+                        return Err(GearmanError::InvalidPacket(PacketError::Parse(Box::new(
+                            ParseError::with_message(format!(
+                                "Expected no packet, found {:?}",
+                                incoming_type
+                            )),
+                        ))));
+                    }
+                }
             }
         }
     }
@@ -220,6 +239,7 @@ impl ClientLoop<'_> {
                     Ok(job_created) => {
                         let handle = job_created.take_handle();
                         let mut jobs = self.conn.jobs.write().await;
+                        log::debug!("Registered job: {:?}", handle);
                         if !jobs.is_registered(&handle) {
                             jobs.register_job(handle);
                         }
