@@ -45,7 +45,7 @@ impl GearmanPacketReader {
             Ok(Err(e)) => return Err(GearmanError::IoError(e)),
             Err(_) => return Err(GearmanError::Timeout),
         }
-
+        
         self.validate_magic_number(&header_buf)?;
         let data_size = self.extract_data_size(&header_buf)?;
 
@@ -53,14 +53,10 @@ impl GearmanPacketReader {
             Header::try_from(&header_buf[..]).map_err(|err| GearmanError::InvalidPacket(err))?;
 
         // Read the body with timeout
+        self.buffer.clear();
         self.buffer.resize(data_size, 0);
         if data_size > 0 {
-            match timeout(self.read_timeout, self.reader.read_exact(&mut self.buffer)).await {
-                Ok(Ok(0)) => return Err(GearmanError::ConnectionClosed),
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => return Err(GearmanError::IoError(e)),
-                Err(_) => return Err(GearmanError::Timeout),
-            }
+            self.read_exact_with_timeout().await?;
         }
 
         let body =
@@ -68,6 +64,27 @@ impl GearmanPacketReader {
         let packet = Packet::new(header, body);
 
         Ok(packet)
+    }
+
+    async fn read_exact_with_timeout(&mut self, ) -> Result<(), GearmanError> {
+        let buf: &mut [u8] = &mut self.buffer;
+        let mut pos = 0;
+        while pos < buf.len() {
+            match timeout(self.read_timeout, self.reader.read(&mut buf[pos..])).await {
+                Ok(Ok(0)) => return Err(GearmanError::ConnectionClosed),
+                Ok(Ok(n)) => pos += n,
+                Ok(Err(e)) if e.kind() == ErrorKind::UnexpectedEof => {
+                    return Err(GearmanError::UnexpectedEof);
+                }
+                Ok(Err(e)) if e.kind() == ErrorKind::WouldBlock => {
+                    // Continue reading on WouldBlock
+                    continue;
+                }
+                Ok(Err(e)) => return Err(GearmanError::IoError(e)),
+                Err(_) => return Err(GearmanError::Timeout),
+            }
+        }
+        Ok(())
     }
 
     /// Validate the magic number in the header

@@ -99,6 +99,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn submit_two_echo_req() {
+        let should_run = Arc::new(AtomicBool::new(true));
+        let server_running = Arc::new(AtomicBool::new(false));
+
+        let server_running_for_server = Arc::clone(&server_running);
+        let server_handle = tokio::task::spawn(async move {
+            let server = TcpListener::bind("127.0.0.1:15005")
+                .await
+                .expect("Failed to initilaize server");
+            server_running_for_server.store(true, Ordering::Relaxed);
+
+            let connection = server.accept().await.expect("Connection unsuccessful");
+
+            let (mut packet_reader, mut packet_writer) =
+                packet_stream(connection.0, Duration::from_secs(30));
+
+            println!("ST: connection set up");
+            let echo_req = EchoReq::from_packet(
+                packet_reader
+                    .read_packet()
+                    .await
+                    .expect("The echo packet must be sent before the connection closes"),
+            )
+            .expect("Failed to parse EchoReq packet");
+
+            println!("ST: got echo_req");
+
+            let echo_res = EchoRes::new(echo_req.as_payload());
+
+            packet_writer
+                .send_packet(&echo_res.to_packet())
+                .await
+                .expect("Failed to return packet");
+            println!("ST: sent echo_res");
+
+            let echo_req = EchoReq::from_packet(
+                packet_reader
+                    .read_packet()
+                    .await
+                    .expect("The echo packet must be sent before the connection closes"),
+            )
+            .expect("Failed to parse EchoReq packet");
+
+            println!("ST: got echo_req 2");
+
+            let echo_res = EchoRes::new(echo_req.as_payload());
+
+            packet_writer
+                .send_packet(&echo_res.to_packet())
+                .await
+                .expect("Failed to return packet");
+            println!("ST: sent echo_res 2");
+        });
+
+        while !server_running.load(Ordering::Relaxed) {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let connection_options = ConnectOptions::new("gearman://127.0.0.1:15005")
+            .expect("Failed to create conn options");
+        let (client, mut client_loop) = Connection::connect(connection_options)
+            .await
+            .expect("failed to connect to client");
+
+        println!("MT: connected to server");
+
+        let should_run_for_runner = Arc::clone(&should_run);
+        let runner_handle = tokio::task::spawn(async move {
+            while should_run_for_runner.load(Ordering::Relaxed) {
+                client_loop.step().await.expect("Failed runner step");
+            }
+            println!("RL: finished runner");
+        });
+
+        println!("MT: started runner");
+
+        let echo = Echo::new("Echo this");
+        let res_fut = echo.submit(&client);
+        println!("MT: submitted echo req");
+
+        let res = res_fut.await.expect("This echo should not fail haha");
+
+        println!("MT: submitted echo req");
+
+        res.validate("Echo this")
+            .expect("Response bytes not equal to request bytes");
+
+        println!("MT: received valid echo_res");
+
+        let echo = Echo::new("Echo this 2");
+        let res_fut = echo.submit(&client);
+        println!("MT: submitted echo req 2");
+
+        let res = res_fut.await.expect("This echo should not fail haha");
+
+        println!("MT: submitted echo req 2");
+
+        res.validate("Echo this 2")
+            .expect("Response bytes not equal to request bytes");
+
+        println!("MT: received valid echo_res 2");
+
+        should_run.store(false, Ordering::Relaxed);
+        runner_handle.await.expect("Failed to join threads");
+        server_handle.await.expect("Failed to join threads");
+
+        println!("MT: cleaned up");
+    }
+
+    #[tokio::test]
     async fn submit_create_job_req() {
         static JOB_HANDLE: &'static [u8] = "test_job_handle".as_bytes();
         static TEST_PAYLOAD: &'static [u8] = "test".as_bytes();

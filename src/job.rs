@@ -3,8 +3,10 @@ use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::task::Waker;
+use std::time::Duration;
 
 use bytes::Bytes;
+use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::Mutex;
 
@@ -40,6 +42,14 @@ impl<T> WaitingQueue<T> {
             .recv()
             .await
             .expect("The channel must be open while this queue exists")
+    }
+    async fn try_read(&mut self) -> Option<T> {
+        match self.receiver
+            .try_recv() {
+                Err(TryRecvError::Empty) => return None,
+                Err(TryRecvError::Disconnected) => panic!("The channel must be open while this queue exists"),
+                Ok(v) => Some(v)
+            }
     }
 }
 
@@ -232,19 +242,35 @@ pub struct JobHandle {
 impl JobHandle {
     // TODO: add status updates
     async fn get_status<'a>(&self, connection: &Client<'a>) -> WorkStatus {
-        self.inner.lock().await.get_status(connection).await
+        // self.inner.lock().await.get_status(connection).await
+        todo!()
     }
     // TODO: add unique status updates
     async fn get_status_unique<'a>(&self, connection: &Client<'a>) -> WorkStatus {
-        self.inner.lock().await.get_status_unique(connection).await
+        // self.inner.lock().await.get_status_unique(connection).await
+        todo!()
     }
     // TODO: If both of these are called with Tokio select then they will deadlock each other.
     // Probably better to replace this with a RwLock!!
     async fn next_warning(&self) -> WorkWarning {
-        self.inner.lock().await.next_warning().await
+        loop {
+            let mut lock = self.inner.lock().await;
+            if let Some(warning) = lock.try_next_warning().await {
+                drop(lock);
+                return warning
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
     }
     async fn next_data(&self) -> WorkData {
-        self.inner.lock().await.next_data().await
+        loop {
+            let mut lock = self.inner.lock().await;
+            if let Some(data) = lock.try_next_data().await {
+                drop(lock);
+                return data
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
     }
 }
 
@@ -275,21 +301,23 @@ impl Future for JobHandle {
 }
 
 impl JobHandleInner {
+    #[allow(unused)] // TODO
     pub(crate) async fn get_status<'a>(&self, _connection: &Client<'a>) -> WorkStatus {
         // let req = GetStatus::new(self.get_handle().await.clone());
         // connection.submit_status(req).await;
         todo!()
     }
+    #[allow(unused)] // TODO
     pub(crate) async fn get_status_unique<'a>(&self, _connection: &Client<'a>) -> WorkStatus {
         // let req = GetStatusUnique::new(self.get_uid().await.clone());
         // connection.submit_status_unique(req).await;
         todo!()
     }
-    pub(crate) async fn next_warning(&mut self) -> WorkWarning {
-        self.warnings.read().await
+    pub(crate) async fn try_next_warning(&mut self) -> Option<WorkWarning> {
+        self.warnings.try_read().await
     }
-    pub(crate) async fn next_data(&mut self) -> WorkData {
-        self.data.read().await
+    pub(crate) async fn try_next_data(&mut self) -> Option<WorkData> {
+        self.data.try_read().await
     }
     pub(crate) fn submit_status(&mut self, status: WorkStatus) {
         self.progress = JobProgress::Percentile {
