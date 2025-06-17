@@ -25,8 +25,8 @@ use std::time::Duration;
 
 use gearrs::job::JobPriority;
 use gearrs::Job;
+use gearrs::{ConnectOptions, Connection};
 
-use super::{ConnectOptions, Connection};
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
 
@@ -51,9 +51,9 @@ async fn main() {
 
     match 
         handle.await {
-            crate::job::JobResult::WorkFail => println!("Worker failed"),
-            crate::job::JobResult::WorkException(excpetion) => println!("Worker returned exception: {:?}", excpetion.get_opaque_response()),
-            crate::job::JobResult::WorkComplete(result) => println!("Worker returned bytes: {:?}", result.get_opaque_response())
+            gearrs::job::JobResult::WorkFail => println!("Worker failed"),
+            gearrs::job::JobResult::WorkException(excpetion) => println!("Worker returned exception: {:?}", excpetion.get_opaque_response()),
+            gearrs::job::JobResult::WorkComplete(result) => println!("Worker returned bytes: {:?}", result.get_opaque_response())
     }
 
     is_running.store(false, Ordering::Relaxed);

@@ -196,25 +196,15 @@ impl Into<Option<WaitingType>> for PacketType {
     }
 }
 
-const REQUEST: i32 = unsafe {
-    union BytesToInt {
-        bytes: [u8; 4],
-        int: i32,
-    }
-    let bytes = BytesToInt {
-        bytes: [b'\0', b'R', b'E', b'Q'],
-    };
-    bytes.int
+const REQUEST: i32 = {
+    let hex = 0x00524551;
+    assert!(hex == 5391697);
+    hex
 };
-const RESPONSE: i32 = unsafe {
-    union BytesToInt {
-        bytes: [u8; 4],
-        int: i32,
-    }
-    let bytes = BytesToInt {
-        bytes: [b'\0', b'R', b'E', b'S'],
-    };
-    bytes.int
+const RESPONSE: i32 = {
+    let hex = 0x00524553;
+    assert!(hex == 0x00524553);
+    hex
 };
 
 #[derive(Clone, Debug)]
