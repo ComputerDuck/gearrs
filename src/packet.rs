@@ -354,13 +354,13 @@ impl From<&str> for Body {
 impl From<String> for Body {
     fn from(value: String) -> Self {
         Body {
-            arguments: vec![Bytes::from(value)],
+            arguments: vec![Bytes::copy_from_slice(value.as_bytes())],
         }
     }
 }
 impl From<&[String]> for Body {
     fn from(value: &[String]) -> Self {
-        let arguments = value.iter().map(|v| Bytes::from(v.to_owned())).collect();
+        let arguments = value.iter().map(|v| Bytes::copy_from_slice(v.as_bytes())).collect();
 
         Body { arguments }
     }
@@ -391,7 +391,7 @@ impl From<&[&str]> for Body {
 }
 impl Into<Bytes> for Body {
     fn into(self) -> Bytes {
-        Bytes::from(self.arguments.join(&('\0' as u8)))
+        Bytes::from(self.arguments.join(&(b'\0')))
     }
 }
 

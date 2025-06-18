@@ -1,0 +1,35 @@
+#!/bin/bash
+set -e
+
+rm -rf target/coverage
+
+export RUSTFLAGS="-C instrument-coverage"
+export LLVM_PROFILE_FILE="target/coverage/coverage-%p-%m.profraw"
+
+cargo test
+
+cd target/coverage
+llvm-profdata merge -sparse coverage-*.profraw -o coverage.profdata
+
+TEST_BINARY=$(ls ../debug/deps/ | grep -E ".*-[a-f0-9]{16}$" | head -1)
+TEST_BINARY="../debug/deps/$TEST_BINARY"
+
+# Generate lcov report for SonarQube
+llvm-cov export $TEST_BINARY \
+    -instr-profile=coverage.profdata \
+    -format=lcov \
+    -ignore-filename-regex='/.cargo/registry' > coverage.lcov
+
+# Generate HTML report for humans
+llvm-cov show $TEST_BINARY \
+    -instr-profile=coverage.profdata \
+    -format=html \
+    -output-dir=html \
+    -ignore-filename-regex='/.cargo/registry'
+
+# Cleanup intermediate files
+rm coverage-*.profraw coverage.profdata
+
+echo "Coverage reports generated:"
+echo "  SonarQube: target/coverage/coverage.lcov"
+echo "  HTML:      target/coverage/html/index.html"

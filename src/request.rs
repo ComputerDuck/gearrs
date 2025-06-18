@@ -81,15 +81,23 @@ impl FromPacket for SubmitJob {
         PacketType::SubmitJob
     }
     fn from_packet(packet: super::packet::Packet) -> Result<Self, ParseError> {
+        use std::str::FromStr;
+
         let arguments = packet.body().arguments();
         let function_name = arguments
             .get(0)
             .ok_or(ParseError::with_message("Arguments payload is too short"))?
             .clone();
-        let uid = Uuid::from_slice(
-            &arguments
-                .get(1)
-                .ok_or(ParseError::with_message("Arguments payload is too short"))?,
+        let uid = Uuid::from_str(
+            &String::from_utf8(
+                arguments
+                    .get(1)
+                    .ok_or(ParseError::with_message("Arguments payload is too short"))?
+                    .to_vec(),
+            )
+            .map_err(|err| {
+                ParseError::with_message(format!("Uuid in payload invalid utf-8: {}", err))
+            })?,
         )
         .map_err(|err| ParseError::with_message(format!("Invalid Uid: {}", err)))?;
         let payload = arguments
@@ -106,7 +114,7 @@ impl FromPacket for SubmitJob {
 }
 impl IntoPacket for SubmitJob {
     fn get_arguments(&self) -> Vec<bytes::Bytes> {
-        let uid = Bytes::from(self.uid.as_bytes().to_vec());
+        let uid = Bytes::from(self.uid.to_string().as_bytes().to_vec());
         vec![self.function_name.clone(), uid, self.payload.clone()]
     }
     fn get_type() -> PacketType {

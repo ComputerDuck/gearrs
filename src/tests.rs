@@ -211,7 +211,7 @@ mod tests {
     #[tokio::test]
     async fn submit_create_job_req() {
         static JOB_HANDLE: &'static [u8] = "test_job_handle".as_bytes();
-        static TEST_PAYLOAD: &'static [u8] = "test".as_bytes();
+        static TEST_PAYLOAD: &'static [u8] = b"test";
         static TEST_FUNCTION_NAME: &'static str = "test";
 
         let should_run = Arc::new(AtomicBool::new(true));

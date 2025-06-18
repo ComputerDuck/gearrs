@@ -1,5 +1,8 @@
 # Roadmap for future releases
 
+### 0.4.0
+- Multi Server support (feature)
+
 ### 0.3.0
 - Add missing request/response types (feature)
 

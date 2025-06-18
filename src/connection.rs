@@ -16,12 +16,28 @@ use crate::request::{EchoReq, GetStatus, GetStatusUnique, OptionReq};
 use crate::response::{EchoRes, Error, JobCreated, OptionRes, StatusRes, StatusResUnique};
 use crate::response::{WorkComplete, WorkData, WorkException, WorkFail, WorkStatus, WorkWarning};
 
+/// A configuration for a Gearman Client
+///
+/// # Examples
+/// ```rust
+/// #[tokio::main]
+/// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+///     let timeout = std::time::Duration::from_secs(1);
+///     let conn_options = gearrs::ConnectOptions::new("gearman://127.0.0.1")?.with_timeout(timeout);
+///
+///     let connection = gearrs::Connection::connect(conn_options).await?;
+///
+///     Ok(())
+/// }
+/// ```
+///
 pub struct ConnectOptions {
     pub address: Url,
     pub timeout: Duration,
 }
 
 impl ConnectOptions {
+    /// Create a new [ConnectOptions] struct with a url
     pub fn new<T>(address: T) -> Result<Self, <Url as TryFrom<T>>::Error>
     where
         Url: TryFrom<T>,
@@ -32,6 +48,7 @@ impl ConnectOptions {
         })
     }
 
+    /// Set a maximum timeout for requests to a server (default is 300 seconds)
     pub fn with_timeout(mut self, dur: Duration) -> Self {
         self.timeout = dur;
         self
@@ -306,7 +323,6 @@ impl ClientLoop<'_> {
                     .await
                     .expect("Job handle lock is owned here");
                 job_handle.submit_complete(work_complete.clone());
-                println!("got here 444");
                 drop(job_handle);
                 job_handle_lock.unregister_job(work_complete.get_job_handle());
             }
