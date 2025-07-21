@@ -137,6 +137,7 @@ pub struct Connection<'a> {
     pub(crate) jobs: RwLock<JobTracker<'a>>,
     ready: Notify,
     waiting: RwLock<Option<WaitingJob>>,
+    waiting_timed_out: Mutex<bool>,
 }
 
 impl<'a> Connection<'a> {
@@ -175,6 +176,7 @@ impl<'a> Connection<'a> {
             jobs: RwLock::new(JobTracker::new()),
             ready: Notify::new(),
             waiting: RwLock::new(None),
+            waiting_timed_out: Mutex::new(false),
         });
 
         Ok((
@@ -252,38 +254,62 @@ impl ClientLoop<'_> {
     async fn handle_waiting(&mut self, packet: Packet, waiting: WaitingJob) {
         match packet.header().get_type() {
             PacketType::JobCreated => {
-                match JobCreated::from_packet(packet.clone()) {
-                    Ok(job_created) => {
-                        let handle = job_created.take_handle();
-                        let mut jobs = self.conn.jobs.write().await;
-                        log::debug!("Registered job: {:?}", handle);
-                        if !jobs.is_registered(&handle) {
-                            jobs.register_job(handle);
+                if !*self.conn.waiting_timed_out.lock().await {
+                    match JobCreated::from_packet(packet.clone()) {
+                        Ok(job_created) => {
+                            let handle = job_created.take_handle();
+                            let mut jobs = self.conn.jobs.write().await;
+                            log::debug!("Registered job: {:?}", handle);
+                            if !jobs.is_registered(&handle) {
+                                jobs.register_job(handle);
+                            }
                         }
+                        Err(_) => {}
                     }
-                    Err(_) => {}
+                    waiting.submit(packet).expect("This waiting job must exist");
                 }
-                waiting.submit(packet).expect("This waiting job must exist");
+                *self.conn.waiting.write().await = None;
+                *self.conn.waiting_timed_out.lock().await = false;
                 self.conn.ready.notify_one();
             }
             PacketType::EchoRes => {
-                waiting.submit(packet).expect("This waiting job must exist");
+                if !*self.conn.waiting_timed_out.lock().await {
+                    waiting.submit(packet).expect("This waiting job must exist");
+                }
+                *self.conn.waiting.write().await = None;
+                *self.conn.waiting_timed_out.lock().await = false;
                 self.conn.ready.notify_one();
             }
             PacketType::OptionRes => {
-                waiting.submit(packet).expect("This waiting job must exist");
+                if !*self.conn.waiting_timed_out.lock().await {
+                    waiting.submit(packet).expect("This waiting job must exist");
+                }
+                *self.conn.waiting.write().await = None;
+                *self.conn.waiting_timed_out.lock().await = false;
                 self.conn.ready.notify_one();
             }
             PacketType::StatusRes => {
-                waiting.submit(packet).expect("This waiting job must exist");
+                if !*self.conn.waiting_timed_out.lock().await {
+                    waiting.submit(packet).expect("This waiting job must exist");
+                }
+                *self.conn.waiting.write().await = None;
+                *self.conn.waiting_timed_out.lock().await = false;
                 self.conn.ready.notify_one();
             }
             PacketType::StatusResUnique => {
-                waiting.submit(packet).expect("This waiting job must exist");
+                if !*self.conn.waiting_timed_out.lock().await {
+                    waiting.submit(packet).expect("This waiting job must exist");
+                }
+                *self.conn.waiting.write().await = None;
+                *self.conn.waiting_timed_out.lock().await = false;
                 self.conn.ready.notify_one();
             }
             PacketType::Error => {
-                let _ = waiting.submit_error(packet);
+                if !*self.conn.waiting_timed_out.lock().await {
+                    let _ = waiting.submit_error(packet);
+                }
+                *self.conn.waiting.write().await = None;
+                *self.conn.waiting_timed_out.lock().await = false;
                 self.conn.ready.notify_one();
             }
             _ => {
@@ -414,7 +440,7 @@ impl Client<'_> {
             match tokio::time::timeout(timeout, receiver).await {
                 Ok(recv) => recv.expect("This channel should only close then the JobCreated command or an error is returned by the server"),
                 Err(_) => {
-                    *self.conn.waiting.write().await = None;
+                    *self.conn.waiting_timed_out.lock().await = true;
                     return Err(GearmanError::Timeout)
                 }
             }
@@ -451,7 +477,7 @@ impl Client<'_> {
             match tokio::time::timeout(timeout, receiver).await {
                 Ok(recv) => recv.expect("This channel should only close then the JobCreated command or an error is returned by the server"),
                 Err(_) => {
-                    *self.conn.waiting.write().await = None;
+                    *self.conn.waiting_timed_out.lock().await = true;
                     return Err(GearmanError::Timeout)
                 }
             }
@@ -489,7 +515,7 @@ impl Client<'_> {
             match tokio::time::timeout(timeout, receiver).await {
                 Ok(recv) => recv.expect("This channel should only close then the JobCreated command or an error is returned by the server"),
                 Err(_) => {
-                    *self.conn.waiting.write().await = None;
+                    *self.conn.waiting_timed_out.lock().await = true;
                     return Err(GearmanError::Timeout)
                 }
             }
@@ -527,7 +553,7 @@ impl Client<'_> {
             match tokio::time::timeout(timeout, receiver).await {
                 Ok(recv) => recv.expect("This channel should only close then the JobCreated command or an error is returned by the server"),
                 Err(_) => {
-                    *self.conn.waiting.write().await = None;
+                    *self.conn.waiting_timed_out.lock().await = true;
                     return Err(GearmanError::Timeout)
                 }
             }
@@ -565,7 +591,7 @@ impl Client<'_> {
             match tokio::time::timeout(timeout, receiver).await {
                 Ok(recv) => recv.expect("This channel should only close then the JobCreated command or an error is returned by the server"),
                 Err(_) => {
-                    *self.conn.waiting.write().await = None;
+                    *self.conn.waiting_timed_out.lock().await = true;
                     return Err(GearmanError::Timeout)
                 }
             }
