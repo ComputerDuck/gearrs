@@ -1,6 +1,8 @@
 use std::convert::TryFrom;
+use std::fs::read;
 use std::io;
 use std::net::ToSocketAddrs;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -137,7 +139,8 @@ pub struct Connection<'a> {
     pub(crate) jobs: RwLock<JobTracker<'a>>,
     ready: Notify,
     waiting: RwLock<Option<WaitingJob>>,
-    waiting_timed_out: Mutex<bool>,
+
+    timed_out: AtomicBool,
 }
 
 impl<'a> Connection<'a> {
@@ -176,7 +179,7 @@ impl<'a> Connection<'a> {
             jobs: RwLock::new(JobTracker::new()),
             ready: Notify::new(),
             waiting: RwLock::new(None),
-            waiting_timed_out: Mutex::new(false),
+            timed_out: AtomicBool::new(false),
         });
 
         Ok((
@@ -233,8 +236,7 @@ impl ClientLoop<'_> {
                         return Err(GearmanError::InvalidPacket(PacketError::Parse(Box::new(
                             ParseError::with_message(format!(
                                 "Expected packet of type {:?}, found {:?}",
-                                handle.waiting_type,
-                                incoming_type
+                                handle.waiting_type, incoming_type
                             )),
                         ))));
                     }
@@ -252,9 +254,18 @@ impl ClientLoop<'_> {
     }
 
     async fn handle_waiting(&mut self, packet: Packet, waiting: WaitingJob) {
-        match packet.header().get_type() {
-            PacketType::JobCreated => {
-                if !*self.conn.waiting_timed_out.lock().await {
+        if self
+            .conn
+            .timed_out
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            log::debug!("Unblocked waiting event loop");
+            self.conn
+                .timed_out
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        } else {
+            match packet.header().get_type() {
+                PacketType::JobCreated => {
                     match JobCreated::from_packet(packet.clone()) {
                         Ok(job_created) => {
                             let handle = job_created.take_handle();
@@ -264,63 +275,41 @@ impl ClientLoop<'_> {
                                 jobs.register_job(handle);
                             }
                         }
-                        Err(_) => {}
+                        Err(_) => return,
                     }
                     waiting.submit(packet).expect("This waiting job must exist");
                 }
-                *self.conn.waiting.write().await = None;
-                *self.conn.waiting_timed_out.lock().await = false;
-                self.conn.ready.notify_one();
-            }
-            PacketType::EchoRes => {
-                if !*self.conn.waiting_timed_out.lock().await {
+                PacketType::EchoRes => {
                     waiting.submit(packet).expect("This waiting job must exist");
                 }
-                *self.conn.waiting.write().await = None;
-                *self.conn.waiting_timed_out.lock().await = false;
-                self.conn.ready.notify_one();
-            }
-            PacketType::OptionRes => {
-                if !*self.conn.waiting_timed_out.lock().await {
+                PacketType::OptionRes => {
                     waiting.submit(packet).expect("This waiting job must exist");
+                    return;
                 }
-                *self.conn.waiting.write().await = None;
-                *self.conn.waiting_timed_out.lock().await = false;
-                self.conn.ready.notify_one();
-            }
-            PacketType::StatusRes => {
-                if !*self.conn.waiting_timed_out.lock().await {
+                PacketType::StatusRes => {
                     waiting.submit(packet).expect("This waiting job must exist");
+                    return;
                 }
-                *self.conn.waiting.write().await = None;
-                *self.conn.waiting_timed_out.lock().await = false;
-                self.conn.ready.notify_one();
-            }
-            PacketType::StatusResUnique => {
-                if !*self.conn.waiting_timed_out.lock().await {
+                PacketType::StatusResUnique => {
                     waiting.submit(packet).expect("This waiting job must exist");
+                    return;
                 }
-                *self.conn.waiting.write().await = None;
-                *self.conn.waiting_timed_out.lock().await = false;
-                self.conn.ready.notify_one();
-            }
-            PacketType::Error => {
-                if !*self.conn.waiting_timed_out.lock().await {
+                PacketType::Error => {
                     let _ = waiting.submit_error(packet);
+                    return;
                 }
-                *self.conn.waiting.write().await = None;
-                *self.conn.waiting_timed_out.lock().await = false;
-                self.conn.ready.notify_one();
-            }
-            _ => {
-                #[cfg(test)]
-                eprintln!(
-                    "Unexpected waiting packet type: {:?}",
-                    packet.header().get_type()
-                );
-                {};
+                _ => {
+                    #[cfg(test)]
+                    eprintln!(
+                        "Unexpected waiting packet type: {:?}",
+                        packet.header().get_type()
+                    );
+                    return;
+                }
             }
         }
+        *self.conn.waiting.write().await = None;
+        self.conn.ready.notify_one();
     }
 
     async fn handle_continuous(&mut self, packet: Packet) {
@@ -410,7 +399,7 @@ impl ClientLoop<'_> {
                     "Unexpected continuous packet type: {:?}",
                     packet.header().get_type()
                 );
-                {};
+                return;
             }
         }
     }
@@ -422,33 +411,51 @@ pub struct Client<'a> {
 }
 
 impl Client<'_> {
+    async fn queue(&self) {
+        if self.conn.waiting.read().await.is_some() {
+            self.conn.ready.notified().await;
+        }
+    }
+
+    async fn create_response_channel(
+        &self,
+        waiting_type: WaitingType,
+    ) -> oneshot::Receiver<WaitingResult> {
+        let (sender, receiver) = oneshot::channel();
+        *self.conn.waiting.write().await = Some(WaitingJob::new(sender, waiting_type));
+        receiver
+    }
+
+    async fn get_result(
+        &self,
+        receiver: tokio::sync::oneshot::Receiver<WaitingResult>,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<WaitingResult, GearmanError> {
+        if let Some(timeout) = timeout {
+            match tokio::time::timeout(timeout, receiver).await {
+                Ok(recv) => Ok(recv.expect("This channel should only close then the JobCreated command or an error is returned by the server")),
+                Err(_) => {
+                    self.conn.timed_out.store(true, std::sync::atomic::Ordering::SeqCst);
+                    log::debug!("Blocked waiting event loop");
+                    Err(GearmanError::Timeout)
+                }
+            }
+        } else {
+            Ok(receiver.await.expect("This channel should only close then the JobCreated command or an error is returned by the server"))
+        }
+    }
+
     pub(super) async fn submit_job(
         &self,
         packet: Packet,
         timeout: Option<std::time::Duration>,
     ) -> Result<JobCreated, GearmanError> {
-        let (sender, receiver) = oneshot::channel();
-        if self.conn.waiting.read().await.is_some() {
-            self.conn.ready.notified().await;
-        }
-        {
-            *self.conn.waiting.write().await =
-                Some(WaitingJob::new(sender, WaitingType::JobCreated));
-        }
+        self.queue().await;
+        let receiver = self.create_response_channel(WaitingType::JobCreated).await;
         self.write_packet(packet).await?;
-        let waiting_result = if let Some(timeout) = timeout {
-            match tokio::time::timeout(timeout, receiver).await {
-                Ok(recv) => recv.expect("This channel should only close then the JobCreated command or an error is returned by the server"),
-                Err(_) => {
-                    *self.conn.waiting_timed_out.lock().await = true;
-                    return Err(GearmanError::Timeout)
-                }
-            }
-        } else {
-            receiver.await.expect("This channel should only close then the JobCreated command or an error is returned by the server")
-        };
+        let result = self.get_result(receiver, timeout).await?;
 
-        match waiting_result {
+        match result {
             WaitingResult::Valid(packet) => {
                 JobCreated::from_packet(packet).map_err(|err| GearmanError::ParseError(err))
             }
@@ -465,26 +472,12 @@ impl Client<'_> {
         packet: EchoReq,
         timeout: Option<std::time::Duration>,
     ) -> Result<EchoRes, GearmanError> {
-        let (sender, receiver) = oneshot::channel();
-        if self.conn.waiting.read().await.is_some() {
-            self.conn.ready.notified().await;
-        }
-        {
-            *self.conn.waiting.write().await = Some(WaitingJob::new(sender, WaitingType::EchoRes));
-        }
+        self.queue().await;
+        let receiver = self.create_response_channel(WaitingType::EchoRes).await;
         self.write_packet(packet.to_packet()).await?;
-        let waiting_result = if let Some(timeout) = timeout {
-            match tokio::time::timeout(timeout, receiver).await {
-                Ok(recv) => recv.expect("This channel should only close then the JobCreated command or an error is returned by the server"),
-                Err(_) => {
-                    *self.conn.waiting_timed_out.lock().await = true;
-                    return Err(GearmanError::Timeout)
-                }
-            }
-        } else {
-            receiver.await.expect("This channel should only close then the JobCreated command or an error is returned by the server")
-        };
-        match waiting_result {
+        let result = self.get_result(receiver, timeout).await?;
+
+        match result {
             WaitingResult::Valid(packet) => {
                 EchoRes::from_packet(packet).map_err(|err| GearmanError::ParseError(err))
             }
@@ -502,27 +495,12 @@ impl Client<'_> {
         packet: OptionReq,
         timeout: Option<std::time::Duration>,
     ) -> Result<OptionRes, GearmanError> {
-        let (sender, receiver) = oneshot::channel();
-        if self.conn.waiting.read().await.is_some() {
-            self.conn.ready.notified().await;
-        }
-        {
-            *self.conn.waiting.write().await =
-                Some(WaitingJob::new(sender, WaitingType::OptionRes));
-        }
+        self.queue().await;
+        let receiver = self.create_response_channel(WaitingType::OptionRes).await;
         self.write_packet(packet.to_packet()).await?;
-        let waiting_result = if let Some(timeout) = timeout {
-            match tokio::time::timeout(timeout, receiver).await {
-                Ok(recv) => recv.expect("This channel should only close then the JobCreated command or an error is returned by the server"),
-                Err(_) => {
-                    *self.conn.waiting_timed_out.lock().await = true;
-                    return Err(GearmanError::Timeout)
-                }
-            }
-        } else {
-            receiver.await.expect("This channel should only close then the JobCreated command or an error is returned by the server")
-        };
-        match waiting_result {
+        let result = self.get_result(receiver, timeout).await?;
+
+        match result {
             WaitingResult::Valid(packet) => {
                 OptionRes::from_packet(packet).map_err(|err| GearmanError::ParseError(err))
             }
@@ -540,27 +518,12 @@ impl Client<'_> {
         packet: GetStatus,
         timeout: Option<std::time::Duration>,
     ) -> Result<StatusRes, GearmanError> {
-        let (sender, receiver) = oneshot::channel();
-        if self.conn.waiting.read().await.is_some() {
-            self.conn.ready.notified().await;
-        }
-        {
-            *self.conn.waiting.write().await =
-                Some(WaitingJob::new(sender, WaitingType::StatusRes));
-        }
+        self.queue().await;
+        let receiver = self.create_response_channel(WaitingType::StatusRes).await;
         self.write_packet(packet.to_packet()).await?;
-        let waiting_result = if let Some(timeout) = timeout {
-            match tokio::time::timeout(timeout, receiver).await {
-                Ok(recv) => recv.expect("This channel should only close then the JobCreated command or an error is returned by the server"),
-                Err(_) => {
-                    *self.conn.waiting_timed_out.lock().await = true;
-                    return Err(GearmanError::Timeout)
-                }
-            }
-        } else {
-            receiver.await.expect("This channel should only close then the JobCreated command or an error is returned by the server")
-        };
-        match waiting_result {
+        let result = self.get_result(receiver, timeout).await?;
+
+        match result {
             WaitingResult::Valid(packet) => {
                 StatusRes::from_packet(packet).map_err(|err| GearmanError::ParseError(err))
             }
@@ -578,27 +541,14 @@ impl Client<'_> {
         packet: GetStatusUnique,
         timeout: Option<std::time::Duration>,
     ) -> Result<StatusResUnique, GearmanError> {
-        let (sender, receiver) = oneshot::channel();
-        if self.conn.waiting.read().await.is_some() {
-            self.conn.ready.notified().await;
-        }
+        self.queue().await;
+        let receiver = self
+            .create_response_channel(WaitingType::StatusResUnique)
+            .await;
         self.write_packet(packet.to_packet()).await?;
-        {
-            *self.conn.waiting.write().await =
-                Some(WaitingJob::new(sender, WaitingType::StatusResUnique));
-        }
-        let waiting_result = if let Some(timeout) = timeout {
-            match tokio::time::timeout(timeout, receiver).await {
-                Ok(recv) => recv.expect("This channel should only close then the JobCreated command or an error is returned by the server"),
-                Err(_) => {
-                    *self.conn.waiting_timed_out.lock().await = true;
-                    return Err(GearmanError::Timeout)
-                }
-            }
-        } else {
-            receiver.await.expect("This channel should only close then the JobCreated command or an error is returned by the server")
-        };
-        match waiting_result {
+        let result = self.get_result(receiver, timeout).await?;
+
+        match result {
             WaitingResult::Valid(packet) => {
                 StatusResUnique::from_packet(packet).map_err(|err| GearmanError::ParseError(err))
             }
