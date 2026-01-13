@@ -261,7 +261,7 @@ impl ClientLoop<'_> {
                             jobs.register_job(handle);
                         }
                     }
-                    Err(_) => (),
+                    Err(err) => log::error!("Could not create job: {err}"),
                 }
                 let _ = waiting.submit(packet);
             }
@@ -396,6 +396,7 @@ impl Client<'_> {
             if self.conn.waiting.read().await.is_none() {
                 return;
             }
+            log::warn!("The Connection is blocked by a previois request");
             self.conn.ready.notified().await;
         }
     }
