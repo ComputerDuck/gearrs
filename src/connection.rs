@@ -139,8 +139,6 @@ pub struct Connection<'a> {
     pub(crate) jobs: RwLock<JobTracker<'a>>,
     ready: Notify,
     waiting: RwLock<Option<WaitingJob>>,
-
-    timed_out: AtomicBool,
 }
 
 impl<'a> Connection<'a> {
@@ -179,7 +177,6 @@ impl<'a> Connection<'a> {
             jobs: RwLock::new(JobTracker::new()),
             ready: Notify::new(),
             waiting: RwLock::new(None),
-            timed_out: AtomicBool::new(false),
         });
 
         Ok((
@@ -218,8 +215,7 @@ impl ClientLoop<'_> {
             let mut waiting_handle_lock = self.conn.waiting.write().await;
             let incoming_type: WaitingType = match packet.header().get_type().into() {
                 Some(waiting_type) => waiting_type,
-                None => return Ok(()), // TODO suspicous packet / unexpected -> but could also be
-                                       // from timed out request
+                None => return Ok(()),
             };
 
             if waiting_handle_lock
@@ -254,58 +250,42 @@ impl ClientLoop<'_> {
     }
 
     async fn handle_waiting(&mut self, packet: Packet, waiting: WaitingJob) {
-        if self
-            .conn
-            .timed_out
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            log::debug!("Unblocked waiting event loop");
-            self.conn
-                .timed_out
-                .store(false, std::sync::atomic::Ordering::SeqCst);
-        } else {
-            match packet.header().get_type() {
-                PacketType::JobCreated => {
-                    match JobCreated::from_packet(packet.clone()) {
-                        Ok(job_created) => {
-                            let handle = job_created.take_handle();
-                            let mut jobs = self.conn.jobs.write().await;
-                            log::debug!("Registered job: {:?}", handle);
-                            if !jobs.is_registered(&handle) {
-                                jobs.register_job(handle);
-                            }
+        match packet.header().get_type() {
+            PacketType::JobCreated => {
+                match JobCreated::from_packet(packet.clone()) {
+                    Ok(job_created) => {
+                        let handle = job_created.take_handle();
+                        let mut jobs = self.conn.jobs.write().await;
+                        log::debug!("Registered job: {:?}", handle);
+                        if !jobs.is_registered(&handle) {
+                            jobs.register_job(handle);
                         }
-                        Err(_) => return,
                     }
-                    waiting.submit(packet).expect("This waiting job must exist");
+                    Err(_) => (),
                 }
-                PacketType::EchoRes => {
-                    waiting.submit(packet).expect("This waiting job must exist");
-                }
-                PacketType::OptionRes => {
-                    waiting.submit(packet).expect("This waiting job must exist");
-                    return;
-                }
-                PacketType::StatusRes => {
-                    waiting.submit(packet).expect("This waiting job must exist");
-                    return;
-                }
-                PacketType::StatusResUnique => {
-                    waiting.submit(packet).expect("This waiting job must exist");
-                    return;
-                }
-                PacketType::Error => {
-                    let _ = waiting.submit_error(packet);
-                    return;
-                }
-                _ => {
-                    #[cfg(test)]
-                    eprintln!(
-                        "Unexpected waiting packet type: {:?}",
-                        packet.header().get_type()
-                    );
-                    return;
-                }
+                let _ = waiting.submit(packet);
+            }
+            PacketType::EchoRes => {
+                let _ = waiting.submit(packet);
+            }
+            PacketType::OptionRes => {
+                let _ = waiting.submit(packet);
+            }
+            PacketType::StatusRes => {
+                let _ = waiting.submit(packet);
+            }
+            PacketType::StatusResUnique => {
+                let _ = waiting.submit(packet);
+            }
+            PacketType::Error => {
+                let _ = waiting.submit_error(packet);
+            }
+            _ => {
+                #[cfg(test)]
+                eprintln!(
+                    "Unexpected waiting packet type: {:?}",
+                    packet.header().get_type()
+                );
             }
         }
         *self.conn.waiting.write().await = None;
@@ -412,7 +392,10 @@ pub struct Client<'a> {
 
 impl Client<'_> {
     async fn queue(&self) {
-        if self.conn.waiting.read().await.is_some() {
+        loop {
+            if self.conn.waiting.read().await.is_none() {
+                return;
+            }
             self.conn.ready.notified().await;
         }
     }
@@ -428,20 +411,20 @@ impl Client<'_> {
 
     async fn get_result(
         &self,
-        receiver: tokio::sync::oneshot::Receiver<WaitingResult>,
-        timeout: Option<std::time::Duration>,
+        receiver: oneshot::Receiver<WaitingResult>,
+        timeout: Option<Duration>,
     ) -> Result<WaitingResult, GearmanError> {
         if let Some(timeout) = timeout {
-            match tokio::time::timeout(timeout, receiver).await {
-                Ok(recv) => Ok(recv.expect("This channel should only close then the JobCreated command or an error is returned by the server")),
-                Err(_) => {
-                    self.conn.timed_out.store(true, std::sync::atomic::Ordering::SeqCst);
-                    log::debug!("Blocked waiting event loop");
+            tokio::select! {
+                res = receiver => {
+                    Ok(res.expect("waiting sender dropped"))
+                }
+                _ = tokio::time::sleep(timeout) => {
                     Err(GearmanError::Timeout)
                 }
             }
         } else {
-            Ok(receiver.await.expect("This channel should only close then the JobCreated command or an error is returned by the server"))
+            Ok(receiver.await.expect("waiting sender dropped"))
         }
     }
 
