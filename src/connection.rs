@@ -1,8 +1,6 @@
 use std::convert::TryFrom;
-use std::fs::read;
 use std::io;
 use std::net::ToSocketAddrs;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,7 +19,7 @@ use crate::response::{WorkComplete, WorkData, WorkException, WorkFail, WorkStatu
 /// A configuration for a Gearman Client
 ///
 /// # Examples
-/// ```rust
+/// ```rust,no_run
 /// #[tokio::main]
 /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ///     let timeout = std::time::Duration::from_secs(1);

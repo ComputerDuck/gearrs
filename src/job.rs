@@ -2,8 +2,8 @@ use std::future::Future;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::task::Poll;
 use std::task::Waker;
-use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::sync::mpsc::error::TryRecvError;
@@ -44,12 +44,13 @@ impl<T> WaitingQueue<T> {
             .expect("The channel must be open while this queue exists")
     }
     async fn try_read(&mut self) -> Option<T> {
-        match self.receiver
-            .try_recv() {
-                Err(TryRecvError::Empty) => return None,
-                Err(TryRecvError::Disconnected) => panic!("The channel must be open while this queue exists"),
-                Ok(v) => Some(v)
+        match self.receiver.try_recv() {
+            Err(TryRecvError::Empty) => return None,
+            Err(TryRecvError::Disconnected) => {
+                panic!("The channel must be open while this queue exists")
             }
+            Ok(v) => Some(v),
+        }
     }
 }
 
@@ -257,7 +258,7 @@ impl JobHandle {
             let mut lock = self.inner.lock().await;
             if let Some(warning) = lock.try_next_warning().await {
                 drop(lock);
-                return warning
+                return warning;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
@@ -267,9 +268,21 @@ impl JobHandle {
             let mut lock = self.inner.lock().await;
             if let Some(data) = lock.try_next_data().await {
                 drop(lock);
-                return data
+                return data;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+    fn try_poll(&mut self) -> Poll<JobResult> {
+        match self.status_receiver.borrow_and_update().deref() {
+            JobStatus::WorkFail => std::task::Poll::Ready(JobResult::WorkFail),
+            JobStatus::WorkException(exception) => {
+                std::task::Poll::Ready(JobResult::WorkException(exception.clone()))
+            }
+            JobStatus::WorkComplete(result) => {
+                std::task::Poll::Ready(JobResult::WorkComplete(result.clone()))
+            }
+            JobStatus::Working => std::task::Poll::Pending,
         }
     }
 }

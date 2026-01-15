@@ -10,7 +10,7 @@ mod options;
 
 pub mod connection;
 pub use connection::GearmanError;
-pub use connection::{ConnectOptions, Connection};
+pub use connection::{Client, ConnectOptions, Connection};
 
 pub mod job;
 pub use job::Job;
@@ -20,4 +20,3 @@ pub use echo::Echo;
 
 // Tests
 mod tests;
-
