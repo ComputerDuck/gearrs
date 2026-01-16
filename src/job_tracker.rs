@@ -5,7 +5,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use tokio::sync::{Mutex, MutexGuard};
 
-use crate::job::JobHandleInner;
+use super::job::JobHandleInner;
 
 pub struct JobTracker<'a> {
     jobs: HashMap<Bytes, Option<Arc<Mutex<JobHandleInner>>>>,

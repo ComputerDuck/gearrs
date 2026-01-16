@@ -157,16 +157,19 @@ impl Job {
             .await?
             .take_handle();
         let waker = Arc::new(StdMutex::new(None));
-        let (status_sender, status_receiver) = tokio::sync::watch::channel(JobStatus::Working);
+        let status = Arc::new(StdMutex::new(JobStatus::Working));
         let job_handle = JobHandle {
-            inner: Arc::new(Mutex::new(JobHandleInner {
-                handle: handle.clone(),
-                uid,
-                waker: waker.clone(),
-                status_sender,
-                ..JobHandleInner::default()
-            })),
-            status_receiver,
+            inner: Arc::new(
+                JobHandleInner {
+                    handle: handle.clone(),
+                    uid,
+                    waker: waker.clone(),
+                    status: status.clone(),
+                    ..JobHandleInner::default()
+                }
+                .into(),
+            ),
+            status: status.clone(),
             waker: waker.clone(),
         };
 
@@ -181,7 +184,7 @@ impl Job {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum JobResult {
     WorkFail,
     WorkException(WorkException),
@@ -236,7 +239,8 @@ impl JobProgress {
 pub struct JobHandle {
     inner: Arc<Mutex<JobHandleInner>>,
     waker: Arc<StdMutex<Option<Waker>>>,
-    status_receiver: tokio::sync::watch::Receiver<JobStatus>,
+
+    status: Arc<StdMutex<JobStatus>>,
 }
 
 #[allow(unused)]
@@ -273,43 +277,42 @@ impl JobHandle {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     }
-    fn try_poll(&mut self) -> Poll<JobResult> {
-        match self.status_receiver.borrow_and_update().deref() {
-            JobStatus::WorkFail => std::task::Poll::Ready(JobResult::WorkFail),
-            JobStatus::WorkException(exception) => {
-                std::task::Poll::Ready(JobResult::WorkException(exception.clone()))
-            }
-            JobStatus::WorkComplete(result) => {
-                std::task::Poll::Ready(JobResult::WorkComplete(result.clone()))
-            }
-            JobStatus::Working => std::task::Poll::Pending,
+    pub fn try_poll(&self) -> Poll<JobResult> {
+        match self.status.lock().expect("Result lock is poisoned").deref() {
+            JobStatus::Working => Poll::Pending,
+            JobStatus::WorkComplete(res) => Poll::Ready(JobResult::WorkComplete(res.clone())),
+            JobStatus::WorkException(res) => Poll::Ready(JobResult::WorkException(res.clone())),
+            JobStatus::WorkFail => Poll::Ready(JobResult::WorkFail),
         }
     }
 }
 
 impl Future for JobHandle {
     type Output = JobResult;
-    fn poll(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
+
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        let mut waker = this.waker.lock().expect("This lock should not be poisoned");
-        match *waker {
-            None => *waker = Some(cx.waker().clone()),
-            Some(_) => {}
+
+        match this.status.lock().expect("Result lock is poisoned").deref() {
+            JobStatus::Working => (),
+            JobStatus::WorkComplete(res) => {
+                return Poll::Ready(JobResult::WorkComplete(res.clone()))
+            }
+            JobStatus::WorkException(res) => {
+                return Poll::Ready(JobResult::WorkException(res.clone()))
+            }
+            JobStatus::WorkFail => return Poll::Ready(JobResult::WorkFail),
+        };
+
+        // Register waker
+        let mut waker = this.waker.lock().unwrap();
+        match &*waker {
+            Some(existing) if existing.will_wake(cx.waker()) => {}
+            _ => *waker = Some(cx.waker().clone()),
         }
 
-        match this.status_receiver.borrow_and_update().deref() {
-            JobStatus::WorkFail => std::task::Poll::Ready(JobResult::WorkFail),
-            JobStatus::WorkException(exception) => {
-                std::task::Poll::Ready(JobResult::WorkException(exception.clone()))
-            }
-            JobStatus::WorkComplete(result) => {
-                std::task::Poll::Ready(JobResult::WorkComplete(result.clone()))
-            }
-            JobStatus::Working => std::task::Poll::Pending,
-        }
+        // Still not complete
+        Poll::Pending
     }
 }
 
@@ -340,31 +343,25 @@ impl JobHandleInner {
     }
     pub(crate) fn submit_complete(&mut self, complete: WorkComplete) {
         let new_status = JobStatus::WorkComplete(complete.clone());
-        self.status = new_status.clone();
-        self.status_sender
-            .send(new_status)
-            .expect("This watch must not be closed before the job is complete");
-        if let Some(ref waker) = *self.waker.lock().expect("This should work") {
+        *self.status.lock().expect("The status lock is poisoned") = new_status.clone();
+
+        if let Some(ref waker) = *self.waker.lock().expect("The waker lock is poisoned") {
             waker.wake_by_ref();
         }
     }
     pub(crate) fn submit_fail(&mut self, _fail: WorkFail) {
         let new_status = JobStatus::WorkFail;
-        self.status = new_status.clone();
-        self.status_sender
-            .send(new_status)
-            .expect("This watch must not be closed before the job is complete");
-        if let Some(ref waker) = *self.waker.lock().expect("This should work") {
+        *self.status.lock().expect("The status lock is poisoned") = new_status.clone();
+
+        if let Some(ref waker) = *self.waker.lock().expect("The waker lock is poisoned") {
             waker.wake_by_ref();
         }
     }
     pub(crate) fn submit_exception(&mut self, exception: WorkException) {
         let new_status = JobStatus::WorkException(exception);
-        self.status = new_status.clone();
-        self.status_sender
-            .send(new_status)
-            .expect("This watch must not be closed before the job is complete");
-        if let Some(ref waker) = *self.waker.lock().expect("This should work") {
+        *self.status.lock().expect("The status lock is poisoned") = new_status.clone();
+
+        if let Some(ref waker) = *self.waker.lock().expect("The waker lock is poisoned") {
             waker.wake_by_ref();
         }
     }
@@ -383,9 +380,8 @@ pub(crate) struct JobHandleInner {
     uid: String,
     warnings: WaitingQueue<WorkWarning>,
     data: WaitingQueue<WorkData>,
-    status: JobStatus,
+    status: Arc<StdMutex<JobStatus>>,
     progress: JobProgress,
-    status_sender: tokio::sync::watch::Sender<JobStatus>,
     waker: Arc<StdMutex<Option<Waker>>>,
 }
 
@@ -396,10 +392,9 @@ impl Default for JobHandleInner {
             uid: String::from(""),
             warnings: WaitingQueue::new(),
             data: WaitingQueue::new(),
-            status: JobStatus::Working,
+            status: Arc::new(JobStatus::Working.into()),
             progress: JobProgress::Unknown,
-            status_sender: tokio::sync::watch::channel(JobStatus::Working).0,
-            waker: Arc::new(StdMutex::new(None)),
+            waker: Arc::new(None.into()),
         }
     }
 }
