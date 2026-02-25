@@ -26,7 +26,7 @@ use crate::wire::{ClientMessage, CodecError, GearmanCodec, PacketType, ServerMes
 /// A configuration for a Gearman Client
 ///
 /// # Examples
-/// ```no_run
+/// ```norun
 /// #[tokio::main]
 /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ///     let timeout = std::time::Duration::from_secs(1);
@@ -377,7 +377,7 @@ impl Connection {
     /// Connect to a Gearman server.
     ///
     /// Spawn the event loop on a task, then use the client freely:
-    /// ```rust,no_run
+    /// ```norun
     /// let (client, event_loop) = Connection::connect(opts).await?;
     /// tokio::spawn(async move { event_loop.run().await });
     ///

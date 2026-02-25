@@ -934,7 +934,7 @@ mod event_loop_tests {
         tokio::spawn(async move { event_loop.run().await });
         tokio::spawn(async move {
             drain_frame(&mut server_io).await;
-            let body = nul(&[b"uid-1", b"1", b"0", b"0", b"0"]);
+            let body = nul(&[b"uid-1", b"1", b"0", b"0", b"0", b"0"]);
             let reply = frame(RES_MAGIC, PacketType::StatusResUnique as i32, &body);
             server_io.write_all(&reply).await.unwrap();
         });

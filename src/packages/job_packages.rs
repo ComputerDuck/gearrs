@@ -11,7 +11,7 @@ pub struct SubmitJob {
     pub unique_id: String,
     pub payload: bytes::Bytes,
     pub priority: Priority,
-    pub foreground: Foreground,
+    pub(crate) foreground: Foreground,
 }
 
 impl IntoRaw for SubmitJob {

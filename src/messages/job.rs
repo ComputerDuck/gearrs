@@ -47,6 +47,7 @@ impl<T> WaitingQueue<T> {
             .send(item)
             .expect("The channel must be open while this queue exists")
     }
+    #[allow(unused)]
     async fn read(&mut self) -> T {
         self.receiver
             .recv()
