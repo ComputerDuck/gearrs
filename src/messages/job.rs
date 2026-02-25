@@ -6,21 +6,31 @@ use std::task::Poll;
 use std::task::Waker;
 
 use bytes::Bytes;
-use tokio::sync::mpsc::error::TryRecvError;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::Mutex;
+use tokio::sync::mpsc::error::TryRecvError;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use uuid::Uuid;
 
 use crate::connection::{Client, GearmanError};
-use crate::packet::IntoPacket;
-use crate::request::{
-    SubmitJob, SubmitJobBG, SubmitJobHigh, SubmitJobHighBG, SubmitJobLow, SubmitJobLowBG,
-};
-use crate::response::{WorkComplete, WorkData, WorkException, WorkFail, WorkStatus, WorkWarning};
+use crate::packages::SubmitJob;
+use crate::packages::{WorkComplete, WorkData, WorkException, WorkFail, WorkStatus, WorkWarning};
 
-pub enum JobPriority {
-    High,
-    Default,
+/// Priority for job submission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Priority {
     Low,
+    #[default]
+    Normal,
+    High,
+}
+
+/// Whether the job runs in the foreground (client tracks results) or
+/// background (fire-and-forget).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum Foreground {
+    #[default]
+    Yes,
+    No,
 }
 
 struct WaitingQueue<T> {
@@ -55,8 +65,8 @@ impl<T> WaitingQueue<T> {
 }
 
 pub struct Job {
-    background: bool,
-    priority: JobPriority,
+    foreground: Foreground,
+    priority: Priority,
     payload: Bytes,
 }
 
@@ -67,17 +77,17 @@ impl Job {
     {
         let payload = Bytes::from(payload);
         Self {
-            background: false,
-            priority: JobPriority::Default,
             payload,
+            foreground: Default::default(),
+            priority: Default::default(),
         }
     }
-    pub fn set_priority(self, priority: JobPriority) -> Self {
+    pub fn set_priority(self, priority: Priority) -> Self {
         Self { priority, ..self }
     }
-    pub fn is_background(self, is_background: bool) -> Self {
+    pub fn set_background(self) -> Self {
         Self {
-            background: is_background,
+            foreground: Foreground::No,
             ..self
         }
     }
@@ -89,73 +99,17 @@ impl Job {
     where
         F: Into<String>,
     {
-        self.inner_submit(function_name, connection, None).await
-    }
-
-    pub async fn submit_with_timeout<'a, F>(
-        self,
-        function_name: F,
-        connection: &Client<'a>,
-        timeout: std::time::Duration,
-    ) -> Result<JobHandle, GearmanError>
-    where
-        F: Into<String>,
-    {
-        self.inner_submit(function_name, connection, Some(timeout))
-            .await
-    }
-
-    async fn inner_submit<'a, F>(
-        self,
-        function_name: F,
-        connection: &Client<'a>,
-        timeout: Option<std::time::Duration>,
-    ) -> Result<JobHandle, GearmanError>
-    where
-        F: Into<String>,
-    {
         let function_name: String = function_name.into();
 
-        let uid;
-        let job_packet = match self.priority {
-            JobPriority::Default => {
-                if !self.background {
-                    let job = SubmitJob::new(function_name, self.payload);
-                    uid = job.get_uid();
-                    job.to_packet()
-                } else {
-                    let job = SubmitJobBG::new(function_name, self.payload);
-                    uid = job.get_uid();
-                    job.to_packet()
-                }
-            }
-            JobPriority::High => {
-                if !self.background {
-                    let job = SubmitJobHigh::new(function_name, self.payload);
-                    uid = job.get_uid();
-                    job.to_packet()
-                } else {
-                    let job = SubmitJobHighBG::new(function_name, self.payload);
-                    uid = job.get_uid();
-                    job.to_packet()
-                }
-            }
-            JobPriority::Low => {
-                if !self.background {
-                    let job = SubmitJobLow::new(function_name, self.payload);
-                    uid = job.get_uid();
-                    job.to_packet()
-                } else {
-                    let job = SubmitJobLowBG::new(function_name, self.payload);
-                    uid = job.get_uid();
-                    job.to_packet()
-                }
-            }
+        let uid = Uuid::new_v4().to_string();
+        let job = SubmitJob {
+            function_name: function_name.into(),
+            unique_id: uid.clone(),
+            payload: self.payload,
+            priority: self.priority,
+            foreground: self.foreground,
         };
-        let handle = connection
-            .submit_job(job_packet, timeout)
-            .await?
-            .take_handle();
+        let handle = connection.submit_job(job).await?.job_handle;
         let waker = Arc::new(StdMutex::new(None));
         let status = Arc::new(StdMutex::new(JobStatus::Working));
         let job_handle = JobHandle {
@@ -174,11 +128,8 @@ impl Job {
         };
 
         connection
-            .conn
-            .jobs
-            .write()
-            .await
-            .register_handle(&handle, job_handle.inner.clone());
+            .add_handle(handle, job_handle.inner.clone())
+            .await;
 
         Ok(job_handle)
     }
@@ -285,6 +236,9 @@ impl JobHandle {
             JobStatus::WorkFail => Poll::Ready(JobResult::WorkFail),
         }
     }
+    pub(crate) async fn handle(&self) -> Bytes {
+        self.inner.lock().await.handle.clone()
+    }
 }
 
 impl Future for JobHandle {
@@ -296,10 +250,10 @@ impl Future for JobHandle {
         match this.status.lock().expect("Result lock is poisoned").deref() {
             JobStatus::Working => (),
             JobStatus::WorkComplete(res) => {
-                return Poll::Ready(JobResult::WorkComplete(res.clone()))
+                return Poll::Ready(JobResult::WorkComplete(res.clone()));
             }
             JobStatus::WorkException(res) => {
-                return Poll::Ready(JobResult::WorkException(res.clone()))
+                return Poll::Ready(JobResult::WorkException(res.clone()));
             }
             JobStatus::WorkFail => return Poll::Ready(JobResult::WorkFail),
         };
@@ -337,8 +291,8 @@ impl JobHandleInner {
     }
     pub(crate) fn submit_status(&mut self, status: WorkStatus) {
         self.progress = JobProgress::Percentile {
-            numerator: status.numerator(),
-            denominator: status.denominator(),
+            numerator: status.numerator as u64,
+            denominator: status.denominator as u64,
         }
     }
     pub(crate) fn submit_complete(&mut self, complete: WorkComplete) {

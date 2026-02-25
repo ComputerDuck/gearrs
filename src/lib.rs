@@ -1,22 +1,14 @@
-// All internal modules
-mod job_tracker;
-mod packet;
-mod packet_stream;
-mod request;
-mod response;
+mod messages;
+mod packages;
+mod wire;
 
-// TODO: make user api for OptionReq or this
-mod options;
+#[cfg(test)]
+mod tests;
 
 pub mod connection;
-pub use connection::GearmanError;
-pub use connection::{Client, ConnectOptions, Connection};
+mod job_tracker;
 
-pub mod job;
-pub use job::Job;
+pub use messages::*;
 
-pub mod echo;
-pub use echo::Echo;
-
-// Tests
-mod tests;
+pub use connection::{Client, ConnectOptions, Connection, EventLoop, GearmanError};
+pub use wire::{MessageError, WireError};

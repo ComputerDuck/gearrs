@@ -1,25 +1,32 @@
 use std::convert::TryFrom;
 use std::io;
-use std::net::ToSocketAddrs;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::net::TcpStream;
-use tokio::sync::{oneshot, Mutex, Notify, RwLock};
+use futures::{SinkExt, StreamExt};
+use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
 use tokio::time::timeout;
+use tokio_util::codec::Framed;
 use url::Url;
 
+#[cfg(not(test))]
+use std::net::ToSocketAddrs;
+#[cfg(not(test))]
+use tokio::net::TcpStream;
+
+#[cfg(test)]
+use tokio::io::DuplexStream;
+
 use crate::job_tracker::JobTracker;
-use crate::packet::{FromPacket, IntoPacket, Packet, PacketError, PacketType, ParseError};
-use crate::packet_stream::{packet_stream, GearmanPacketReader, GearmanPacketSender};
-use crate::request::{EchoReq, GetStatus, GetStatusUnique, OptionReq};
-use crate::response::{EchoRes, Error, JobCreated, OptionRes, StatusRes, StatusResUnique};
-use crate::response::{WorkComplete, WorkData, WorkException, WorkFail, WorkStatus, WorkWarning};
+use crate::messages::job::JobHandleInner;
+use crate::packages::{Echo, GetStatus, GetStatusUnique, OptionRes, SetOption, SubmitJob};
+use crate::packages::{JobCreated, ServerError, StatusRes, StatusResUnique};
+use crate::wire::{ClientMessage, CodecError, GearmanCodec, PacketType, ServerMessage};
 
 /// A configuration for a Gearman Client
 ///
 /// # Examples
-/// ```rust,no_run
+/// ```no_run
 /// #[tokio::main]
 /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ///     let timeout = std::time::Duration::from_secs(1);
@@ -55,37 +62,18 @@ impl ConnectOptions {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum GearmanError {
-    ServerError(Error),
-    IoError(io::Error),
-    ParseError(ParseError),
-    InvalidPacket(PacketError),
+    #[error("server error {code}: {message}")]
+    ServerError { code: String, message: String },
+    #[error(transparent)]
+    Io(#[from] io::Error),
+    #[error(transparent)]
+    Codec(#[from] CodecError),
+    #[error("operation timed out")]
     Timeout,
+    #[error("connection closed")]
     ConnectionClosed,
-    UnexpectedEof,
-}
-
-impl std::fmt::Display for GearmanError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            GearmanError::ServerError(msg) => write!(f, "Server error: {}", msg),
-            GearmanError::IoError(err) => write!(f, "IO error: {}", err),
-            GearmanError::ParseError(err) => write!(f, "Unable to Parse Packet: {}", err),
-            GearmanError::InvalidPacket(err) => write!(f, "Invalid Packet: {}", err),
-            GearmanError::ConnectionClosed => write!(f, "Connection closed"),
-            GearmanError::Timeout => write!(f, "Operation timed out"),
-            GearmanError::UnexpectedEof => write!(f, "Unexpected Eof"),
-        }
-    }
-}
-
-impl std::error::Error for GearmanError {}
-
-impl From<std::io::Error> for GearmanError {
-    fn from(err: std::io::Error) -> Self {
-        GearmanError::IoError(err)
-    }
 }
 
 impl From<tokio::time::error::Elapsed> for GearmanError {
@@ -94,465 +82,342 @@ impl From<tokio::time::error::Elapsed> for GearmanError {
     }
 }
 
-#[derive(PartialEq, Debug, Clone)]
-pub(crate) enum WaitingType {
-    OptionRes,
-    StatusResUnique,
-    JobCreated,
-    EchoRes,
-    StatusRes,
-}
-
-#[derive(Debug)]
-enum WaitingResult {
-    Error(Packet),
-    Valid(Packet),
-}
-
-#[derive(Debug)]
-struct WaitingJob {
-    waiting_type: WaitingType,
-    waiting_job: oneshot::Sender<WaitingResult>,
-}
-impl WaitingJob {
-    fn new(sender: oneshot::Sender<WaitingResult>, waiting_type: WaitingType) -> Self {
-        Self {
-            waiting_type,
-            waiting_job: sender,
+impl From<ServerError> for GearmanError {
+    fn from(e: ServerError) -> Self {
+        GearmanError::ServerError {
+            code: e.code.string_representation(),
+            message: e.message,
         }
     }
-    fn submit(self, packet: Packet) -> Result<(), WaitingResult> {
-        self.waiting_job.send(WaitingResult::Valid(packet))
-    }
-
-    fn submit_error(self, error: Packet) -> Result<(), WaitingResult> {
-        self.waiting_job.send(WaitingResult::Error(error))
-    }
-    fn is_type(&self, other: WaitingType) -> bool {
-        self.waiting_type == other
-    }
 }
 
-pub struct Connection<'a> {
+/// A pending request waiting for exactly one reply packet from the server.
+pub(crate) struct PendingRequest {
+    message: Option<ClientMessage>,
+    reply_tx: oneshot::Sender<Result<ServerMessage, GearmanError>>,
+}
+
+pub(crate) struct SharedState<'a> {
     pub(crate) jobs: RwLock<JobTracker<'a>>,
-    ready: Notify,
-    waiting: RwLock<Option<WaitingJob>>,
 }
 
-impl<'a> Connection<'a> {
-    /// Connect to a Gearman Server via Tcp
-    ///
-    /// This function will fail if the url is invalid or the connection timeout is reached
-    pub async fn connect(
-        options: ConnectOptions,
-    ) -> Result<(Client<'a>, ClientLoop<'a>), std::io::Error> {
-        // Parse and validate address
-        let url = options.address;
+impl<'a> SharedState<'a> {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            jobs: RwLock::new(JobTracker::new()),
+        })
+    }
+}
 
-        let host = url.host_str().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "Missing host in URL")
-        })?;
+/// A cheaply cloneable handle for sending requests to a Gearman server.
+///
+/// All requests are serialised through an internal channel so the underlying
+/// TCP connection is never accessed concurrently. Clone freely. every clone
+/// shares the same connection.
+#[derive(Clone)]
+pub struct Client<'a> {
+    cmd_tx: mpsc::Sender<PendingRequest>,
+    timeout: Duration,
+    state: Arc<SharedState<'a>>,
+}
 
-        let port = url.port_or_known_default().unwrap_or(4730);
+impl<'a> Client<'a> {
+    pub(crate) async fn add_handle(&self, handle: bytes::Bytes, inner: Arc<Mutex<JobHandleInner>>) {
+        self.state
+            .jobs
+            .write()
+            .await
+            .register_handle(&handle, inner);
+    }
+    async fn request(&self, message: ClientMessage) -> Result<ServerMessage, GearmanError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
 
-        let addr = format!("{}:{}", host, port);
-        let mut addrs = addr.to_socket_addrs()?;
+        self.cmd_tx
+            .send(PendingRequest {
+                message: Some(message),
+                reply_tx,
+            })
+            .await
+            .map_err(|_| GearmanError::ConnectionClosed)?;
 
-        let stream = match timeout(options.timeout, TcpStream::connect(addrs.next().unwrap())).await
+        timeout(self.timeout, reply_rx)
+            .await
+            .map_err(|_| GearmanError::Timeout)?
+            .map_err(|_| GearmanError::ConnectionClosed)?
+    }
+
+    pub async fn submit_job(&self, req: SubmitJob) -> Result<JobCreated, GearmanError> {
+        match self.request(ClientMessage::SubmitJob(req)).await? {
+            ServerMessage::JobCreated(r) => Ok(r),
+            ServerMessage::Error(e) => Err(e.into()),
+            m => Err(GearmanError::Codec(CodecError::UnexpectedMessage {
+                expected: PacketType::JobCreated,
+                received: m,
+            })),
+        }
+    }
+
+    pub async fn echo(&self, payload: Vec<u8>) -> Result<Vec<u8>, GearmanError> {
+        match self
+            .request(ClientMessage::Echo(Echo {
+                payload: payload.into(),
+            }))
+            .await?
         {
-            Ok(Ok(stream)) => stream,
-            Ok(Err(e)) => return Err(e),
-            Err(_) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "Connection timed out",
-                ));
+            ServerMessage::EchoRes(r) => Ok(r.payload.into()),
+            ServerMessage::Error(e) => Err(e.into()),
+            m => Err(GearmanError::Codec(CodecError::UnexpectedMessage {
+                expected: PacketType::EchoRes,
+                received: m,
+            })),
+        }
+    }
+
+    pub async fn job_status(&self, req: GetStatus) -> Result<StatusRes, GearmanError> {
+        match self.request(ClientMessage::GetStatus(req)).await? {
+            ServerMessage::StatusRes(r) => Ok(r),
+            ServerMessage::Error(e) => Err(e.into()),
+            m => Err(GearmanError::Codec(CodecError::UnexpectedMessage {
+                expected: PacketType::StatusRes,
+                received: m,
+            })),
+        }
+    }
+
+    pub async fn job_status_unique(
+        &self,
+        req: GetStatusUnique,
+    ) -> Result<StatusResUnique, GearmanError> {
+        match self.request(ClientMessage::GetStatusUnique(req)).await? {
+            ServerMessage::StatusResUnique(r) => Ok(r),
+            ServerMessage::Error(e) => Err(e.into()),
+            m => Err(GearmanError::Codec(CodecError::UnexpectedMessage {
+                expected: PacketType::StatusResUnique,
+                received: m,
+            })),
+        }
+    }
+
+    pub async fn set_option(&self, req: SetOption) -> Result<OptionRes, GearmanError> {
+        match self.request(ClientMessage::SetOption(req)).await? {
+            ServerMessage::OptionRes(res) => Ok(res),
+            ServerMessage::Error(e) => Err(e.into()),
+            m => Err(GearmanError::Codec(CodecError::UnexpectedMessage {
+                expected: PacketType::OptionRes,
+                received: m,
+            })),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        cmd_tx: mpsc::Sender<PendingRequest>,
+        timeout: std::time::Duration,
+        state: Arc<SharedState<'a>>,
+    ) -> Self {
+        Self {
+            timeout,
+            cmd_tx,
+            state,
+        }
+    }
+}
+
+/// Drives the connection. Must be `.run()` (or `.step()`-ed) concurrently with
+/// any [`Client`] usage, typically on a spawned task.
+pub struct EventLoop<'a> {
+    #[cfg(not(test))]
+    frame: Framed<TcpStream, GearmanCodec>,
+    #[cfg(test)]
+    frame: Framed<DuplexStream, GearmanCodec>,
+    cmd_rx: mpsc::Receiver<PendingRequest>,
+    pending: Option<PendingRequest>,
+    state: Arc<SharedState<'a>>,
+}
+
+impl<'a> EventLoop<'a> {
+    /// Run until the connection is closed or an unrecoverable error occurs.
+    pub async fn run(mut self) -> Result<(), GearmanError> {
+        loop {
+            self.step().await?;
+        }
+    }
+
+    /// Advance the event loop by one event (a command from a [`Client`] or an
+    /// incoming packet from the server).
+    pub async fn step(&mut self) -> Result<(), GearmanError> {
+        tokio::select! {
+            biased;
+
+            cmd = self.cmd_rx.recv() => match cmd {
+                None => return Err(GearmanError::ConnectionClosed),
+                Some(req) => self.handle_command(req).await?,
+            },
+
+            msg = self.frame.next() => match msg {
+                None => return Err(GearmanError::ConnectionClosed),
+                Some(Err(e)) => return Err(GearmanError::Codec(e)),
+                Some(Ok(msg)) => self.handle_message(msg).await,
+            },
+        }
+
+        Ok(())
+    }
+
+    async fn handle_command(&mut self, mut req: PendingRequest) -> Result<(), GearmanError> {
+        if self.pending.is_some() {
+            let _ = req
+                .reply_tx
+                .send(Err(GearmanError::Codec(CodecError::RequestAlreadyInFlight)));
+            return Ok(());
+        }
+
+        assert!(
+            req.message.is_some(),
+            "A Pending Request in the queue should always contain a payload, otherwise there is a bug in the code"
+        );
+
+        self.frame
+            .send(req.message.take().unwrap())
+            .await
+            .map_err(GearmanError::Codec)?;
+
+        self.pending = Some(req);
+        Ok(())
+    }
+
+    async fn handle_message(&mut self, msg: ServerMessage) {
+        if msg.is_async() {
+            self.handle_async(msg).await;
+        } else {
+            self.handle_reply(msg).await;
+        }
+    }
+
+    async fn handle_reply(&mut self, msg: ServerMessage) {
+        match self.pending.take() {
+            None => log::warn!("Received reply with no pending request: {msg:?}"),
+            Some(req) => {
+                if let ServerMessage::JobCreated(ref created) = msg {
+                    self.register_job(&created.job_handle).await;
+                }
+                let _ = req.reply_tx.send(Ok(msg));
+            }
+        }
+    }
+
+    async fn handle_async(&mut self, msg: ServerMessage) {
+        let handle = match msg.job_handle() {
+            Some(h) => h.clone(),
+            None => {
+                log::warn!("Async message missing job handle: {msg:?}");
+                return;
             }
         };
 
-        let (reader, writer) = packet_stream(stream, options.timeout);
-        let connection = Arc::new(Self {
-            jobs: RwLock::new(JobTracker::new()),
-            ready: Notify::new(),
-            waiting: RwLock::new(None),
-        });
+        let mut jobs = self.state.jobs.write().await;
+        let Some(mut job) = jobs.get_handle_mut(&handle).await else {
+            log::warn!("Update for unknown job {handle:?}");
+            return;
+        };
+
+        match msg {
+            ServerMessage::WorkStatus(m) => job.submit_status(m),
+            ServerMessage::WorkData(m) => job.submit_data(m),
+            ServerMessage::WorkWarning(m) => job.submit_warning(m),
+            ServerMessage::WorkComplete(m) => {
+                job.submit_complete(m);
+                drop(job);
+                jobs.unregister_job(&handle);
+            }
+            ServerMessage::WorkFail(m) => {
+                job.submit_fail(m);
+                drop(job);
+                jobs.unregister_job(&handle);
+            }
+            ServerMessage::WorkException(m) => {
+                job.submit_exception(m);
+                drop(job);
+                jobs.unregister_job(&handle);
+            }
+            _ => unreachable!("is_async() guarantees only work packets reach here"),
+        }
+    }
+
+    async fn register_job(&self, handle: &bytes::Bytes) {
+        let mut jobs = self.state.jobs.write().await;
+        if !jobs.is_registered(handle) {
+            jobs.register_job(handle.clone());
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        framed: Framed<DuplexStream, GearmanCodec>,
+        cmd_rx: mpsc::Receiver<PendingRequest>,
+        state: Arc<SharedState<'a>>,
+    ) -> Self {
+        Self {
+            frame: framed,
+            cmd_rx: cmd_rx,
+            pending: None,
+            state,
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn state_handle(&self) -> Arc<SharedState<'a>> {
+        self.state.clone()
+    }
+}
+
+pub struct Connection;
+
+#[cfg(not(test))]
+impl Connection {
+    /// Connect to a Gearman server.
+    ///
+    /// Spawn the event loop on a task, then use the client freely:
+    /// ```rust,no_run
+    /// let (client, event_loop) = Connection::connect(opts).await?;
+    /// tokio::spawn(async move { event_loop.run().await });
+    ///
+    /// client.echo(b"ping".to_vec()).await?;
+    /// ```
+    pub async fn connect<'a>(
+        options: ConnectOptions,
+    ) -> Result<(Client<'a>, EventLoop<'a>), io::Error> {
+        let host = options
+            .address
+            .host_str()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Missing host in URL"))?;
+        let port = options.address.port_or_known_default().unwrap_or(4730);
+        let socket_addr = format!("{host}:{port}")
+            .to_socket_addrs()?
+            .next()
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "Could not resolve address")
+            })?;
+
+        let stream = timeout(options.timeout, TcpStream::connect(socket_addr))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Connection timed out"))??;
+
+        let frame = Framed::new(stream, GearmanCodec);
+        let (cmd_tx, cmd_rx) = mpsc::channel(32);
+        let state = SharedState::new();
 
         Ok((
             Client {
-                writer: Arc::new(Mutex::new(writer)),
-                conn: Arc::clone(&connection),
+                cmd_tx,
+                timeout: options.timeout,
+                state: Arc::clone(&state),
             },
-            ClientLoop {
-                reader,
-                conn: Arc::clone(&connection),
+            EventLoop {
+                frame,
+                cmd_rx,
+                pending: None,
+                state,
             },
         ))
-    }
-}
-
-pub struct ClientLoop<'a> {
-    reader: GearmanPacketReader,
-    conn: Arc<Connection<'a>>,
-}
-
-impl ClientLoop<'_> {
-    /// This progresses the runner by one step. This should be run in a continous loop
-    /// to listen for any incoming packages and parse them
-    pub async fn step(&mut self) -> Result<(), GearmanError> {
-        let packet = match self.reader.read_packet().await {
-            Ok(packet) => packet,
-            Err(GearmanError::UnexpectedEof) => return Ok(()),
-            Err(err) => return Err(err),
-        };
-        if packet.header().get_type().is_continuous() {
-            log::debug!("Received a continous packet: {packet:?}");
-            self.handle_continuous(packet).await;
-            Ok(())
-        } else {
-            log::debug!("Received a waiting packet: {packet:?}");
-            let mut waiting_handle_lock = self.conn.waiting.write().await;
-            let incoming_type: WaitingType = match packet.header().get_type().into() {
-                Some(waiting_type) => waiting_type,
-                None => return Ok(()),
-            };
-
-            if waiting_handle_lock
-                .as_ref()
-                .is_some_and(|w| w.is_type(incoming_type.clone()))
-            {
-                let waiting_handle = waiting_handle_lock.take().unwrap();
-                drop(waiting_handle_lock);
-                self.handle_waiting(packet, waiting_handle).await;
-                Ok(())
-            } else {
-                match waiting_handle_lock.as_ref() {
-                    Some(handle) => {
-                        return Err(GearmanError::InvalidPacket(PacketError::Parse(Box::new(
-                            ParseError::with_message(format!(
-                                "Expected packet of type {:?}, found {:?}",
-                                handle.waiting_type, incoming_type
-                            )),
-                        ))));
-                    }
-                    None => {
-                        return Err(GearmanError::InvalidPacket(PacketError::Parse(Box::new(
-                            ParseError::with_message(format!(
-                                "Expected no packet, found {:?}",
-                                incoming_type
-                            )),
-                        ))));
-                    }
-                }
-            }
-        }
-    }
-
-    async fn handle_waiting(&mut self, packet: Packet, waiting: WaitingJob) {
-        match packet.header().get_type() {
-            PacketType::JobCreated => {
-                match JobCreated::from_packet(packet.clone()) {
-                    Ok(job_created) => {
-                        let handle = job_created.take_handle();
-                        let mut jobs = self.conn.jobs.write().await;
-                        log::debug!("Registered job: {:?}", handle);
-                        if !jobs.is_registered(&handle) {
-                            jobs.register_job(handle);
-                        }
-                    }
-                    Err(err) => log::error!("Could not create job: {err}"),
-                }
-                let _ = waiting.submit(packet);
-            }
-            PacketType::EchoRes => {
-                let _ = waiting.submit(packet);
-            }
-            PacketType::OptionRes => {
-                let _ = waiting.submit(packet);
-            }
-            PacketType::StatusRes => {
-                let _ = waiting.submit(packet);
-            }
-            PacketType::StatusResUnique => {
-                let _ = waiting.submit(packet);
-            }
-            PacketType::Error => {
-                let _ = waiting.submit_error(packet);
-            }
-            _ => {
-                #[cfg(test)]
-                eprintln!(
-                    "Unexpected waiting packet type: {:?}",
-                    packet.header().get_type()
-                );
-            }
-        }
-        *self.conn.waiting.write().await = None;
-        self.conn.ready.notify_one();
-    }
-
-    async fn handle_continuous(&mut self, packet: Packet) {
-        match packet.header().get_type() {
-            PacketType::WorkStatus => {
-                let work_status = match WorkStatus::from_packet(packet).ok() {
-                    Some(work_status) => work_status,
-                    None => return,
-                };
-                let job_handle_lock = self.conn.jobs.write().await;
-                let mut job_handle = job_handle_lock
-                    .get_handle_mut(work_status.get_job_handle())
-                    .await
-                    .expect("Job handle lock is owned here");
-                job_handle.submit_status(work_status);
-                drop(job_handle);
-            }
-            PacketType::WorkComplete => {
-                let work_complete = match WorkComplete::from_packet(packet).ok() {
-                    Some(work_complete) => work_complete,
-                    None => return,
-                };
-                let mut job_handle_lock = self.conn.jobs.write().await;
-                let mut job_handle = job_handle_lock
-                    .get_handle_mut(work_complete.get_job_handle())
-                    .await
-                    .expect("Job handle lock is owned here");
-                job_handle.submit_complete(work_complete.clone());
-                drop(job_handle);
-                job_handle_lock.unregister_job(work_complete.get_job_handle());
-            }
-            PacketType::WorkFail => {
-                let work_fail = match WorkFail::from_packet(packet).ok() {
-                    Some(work_fail) => work_fail,
-                    None => return,
-                };
-                let mut job_handle_lock = self.conn.jobs.write().await;
-                let mut job_handle = job_handle_lock
-                    .get_handle_mut(work_fail.get_job_handle())
-                    .await
-                    .expect("Job handle lock is owned here");
-                job_handle.submit_fail(work_fail.clone());
-                drop(job_handle);
-                job_handle_lock.unregister_job(work_fail.get_job_handle());
-            }
-            PacketType::WorkException => {
-                let work_exception = match WorkException::from_packet(packet).ok() {
-                    Some(work_exception) => work_exception,
-                    None => return,
-                };
-                let mut job_handle_lock = self.conn.jobs.write().await;
-                let mut job_handle = job_handle_lock
-                    .get_handle_mut(work_exception.get_job_handle())
-                    .await
-                    .expect("Job handle lock is owned here");
-                job_handle.submit_exception(work_exception.clone());
-                drop(job_handle);
-                job_handle_lock.unregister_job(work_exception.get_job_handle());
-            }
-            PacketType::WorkData => {
-                let work_data = match WorkData::from_packet(packet).ok() {
-                    Some(work_data) => work_data,
-                    None => return,
-                };
-                let job_handle_lock = self.conn.jobs.write().await;
-                let job_handle = job_handle_lock
-                    .get_handle_mut(work_data.get_job_handle())
-                    .await
-                    .expect("Job handle lock is owned here");
-                job_handle.submit_data(work_data);
-            }
-            PacketType::WorkWarning => {
-                let work_warning = match WorkWarning::from_packet(packet).ok() {
-                    Some(work_warning) => work_warning,
-                    None => return,
-                };
-                let job_handle_lock = self.conn.jobs.write().await;
-                let job_handle = job_handle_lock
-                    .get_handle_mut(work_warning.get_job_handle())
-                    .await
-                    .expect("Job handle lock is owned here");
-                job_handle.submit_warning(work_warning);
-            }
-            _ => {
-                #[cfg(test)]
-                eprintln!(
-                    "Unexpected continuous packet type: {:?}",
-                    packet.header().get_type()
-                );
-                return;
-            }
-        }
-    }
-}
-
-pub struct Client<'a> {
-    writer: Arc<Mutex<GearmanPacketSender>>,
-    pub(crate) conn: Arc<Connection<'a>>,
-}
-
-impl Client<'_> {
-    async fn queue(&self) {
-        loop {
-            if self.conn.waiting.read().await.is_none() {
-                return;
-            }
-            log::warn!("The Connection is blocked by a previois request");
-            self.conn.ready.notified().await;
-        }
-    }
-
-    async fn create_response_channel(
-        &self,
-        waiting_type: WaitingType,
-    ) -> oneshot::Receiver<WaitingResult> {
-        let (sender, receiver) = oneshot::channel();
-        *self.conn.waiting.write().await = Some(WaitingJob::new(sender, waiting_type));
-        receiver
-    }
-
-    async fn get_result(
-        &self,
-        receiver: oneshot::Receiver<WaitingResult>,
-        timeout: Option<Duration>,
-    ) -> Result<WaitingResult, GearmanError> {
-        if let Some(timeout) = timeout {
-            tokio::select! {
-                res = receiver => {
-                    Ok(res.expect("waiting sender dropped"))
-                }
-                _ = tokio::time::sleep(timeout) => {
-                    Err(GearmanError::Timeout)
-                }
-            }
-        } else {
-            Ok(receiver.await.expect("waiting sender dropped"))
-        }
-    }
-
-    pub(super) async fn submit_job(
-        &self,
-        packet: Packet,
-        timeout: Option<std::time::Duration>,
-    ) -> Result<JobCreated, GearmanError> {
-        self.queue().await;
-        let receiver = self.create_response_channel(WaitingType::JobCreated).await;
-        self.write_packet(packet).await?;
-        let result = self.get_result(receiver, timeout).await?;
-
-        match result {
-            WaitingResult::Valid(packet) => {
-                JobCreated::from_packet(packet).map_err(|err| GearmanError::ParseError(err))
-            }
-            WaitingResult::Error(err_packet) => {
-                let error =
-                    Error::from_packet(err_packet).map_err(|err| GearmanError::ParseError(err))?;
-                Err(GearmanError::ServerError(error))
-            }
-        }
-    }
-
-    pub(super) async fn submit_echo(
-        &self,
-        packet: EchoReq,
-        timeout: Option<std::time::Duration>,
-    ) -> Result<EchoRes, GearmanError> {
-        self.queue().await;
-        let receiver = self.create_response_channel(WaitingType::EchoRes).await;
-        self.write_packet(packet.to_packet()).await?;
-        let result = self.get_result(receiver, timeout).await?;
-
-        match result {
-            WaitingResult::Valid(packet) => {
-                EchoRes::from_packet(packet).map_err(|err| GearmanError::ParseError(err))
-            }
-            WaitingResult::Error(err_packet) => {
-                let error =
-                    Error::from_packet(err_packet).map_err(|err| GearmanError::ParseError(err))?;
-                Err(GearmanError::ServerError(error))
-            }
-        }
-    }
-
-    #[allow(unused)] // TODO: add OptionReq
-    pub(super) async fn submit_option(
-        &self,
-        packet: OptionReq,
-        timeout: Option<std::time::Duration>,
-    ) -> Result<OptionRes, GearmanError> {
-        self.queue().await;
-        let receiver = self.create_response_channel(WaitingType::OptionRes).await;
-        self.write_packet(packet.to_packet()).await?;
-        let result = self.get_result(receiver, timeout).await?;
-
-        match result {
-            WaitingResult::Valid(packet) => {
-                OptionRes::from_packet(packet).map_err(|err| GearmanError::ParseError(err))
-            }
-            WaitingResult::Error(err_packet) => {
-                let error =
-                    Error::from_packet(err_packet).map_err(|err| GearmanError::ParseError(err))?;
-                Err(GearmanError::ServerError(error))
-            }
-        }
-    }
-
-    #[allow(unused)] // TODO: add StatusReq
-    pub(super) async fn submit_status(
-        &self,
-        packet: GetStatus,
-        timeout: Option<std::time::Duration>,
-    ) -> Result<StatusRes, GearmanError> {
-        self.queue().await;
-        let receiver = self.create_response_channel(WaitingType::StatusRes).await;
-        self.write_packet(packet.to_packet()).await?;
-        let result = self.get_result(receiver, timeout).await?;
-
-        match result {
-            WaitingResult::Valid(packet) => {
-                StatusRes::from_packet(packet).map_err(|err| GearmanError::ParseError(err))
-            }
-            WaitingResult::Error(err_packet) => {
-                let error =
-                    Error::from_packet(err_packet).map_err(|err| GearmanError::ParseError(err))?;
-                Err(GearmanError::ServerError(error))
-            }
-        }
-    }
-
-    #[allow(unused)] // TODO: add StatusReqUnique
-    pub(super) async fn submit_status_unique(
-        &self,
-        packet: GetStatusUnique,
-        timeout: Option<std::time::Duration>,
-    ) -> Result<StatusResUnique, GearmanError> {
-        self.queue().await;
-        let receiver = self
-            .create_response_channel(WaitingType::StatusResUnique)
-            .await;
-        self.write_packet(packet.to_packet()).await?;
-        let result = self.get_result(receiver, timeout).await?;
-
-        match result {
-            WaitingResult::Valid(packet) => {
-                StatusResUnique::from_packet(packet).map_err(|err| GearmanError::ParseError(err))
-            }
-            WaitingResult::Error(err_packet) => {
-                let error =
-                    Error::from_packet(err_packet).map_err(|err| GearmanError::ParseError(err))?;
-                Err(GearmanError::ServerError(error))
-            }
-        }
-    }
-
-    async fn write_packet(&self, packet: Packet) -> Result<(), GearmanError> {
-        let mut writer_lock = self.writer.lock().await;
-        writer_lock.send_packet(&packet).await
-    }
-}
-
-impl Clone for Client<'_> {
-    fn clone(&self) -> Self {
-        Self {
-            writer: Arc::clone(&self.writer),
-            conn: Arc::clone(&self.conn),
-        }
     }
 }

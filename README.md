@@ -7,10 +7,10 @@
 
 - **GearmanJobs**: Support for job submission with **priority** and **background** options.
 - **EchoRequest**: Echo functionality for testing communication
+- **OptionsReq**: Setting Server options
 
 ### Upcoming Features
 
-- **OptionsReq**: Setting Server options
 - **StatusReq**: Allows querying the status of jobs.
 - **Scheduled Jobs**: scheduling jobs 
 
